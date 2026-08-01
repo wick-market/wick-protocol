@@ -587,23 +587,34 @@ fn test_duplicate_round_same_oracle_tick_rejected() {
 #[test]
 fn test_invalid_asset_rejected() {
     let ctx = Ctx::new();
-    // XLM excluded in v1.
-    let res = ctx.client().try_create_round(&Symbol::new(&ctx.env, "XLM"));
+    // Unlisted assets are rejected regardless of oracle data.
+    let res = ctx.client().try_create_round(&Symbol::new(&ctx.env, "DOGE"));
     expect_err!(res, Error::InvalidAsset);
 }
 
 #[test]
-fn test_eth_and_sol_rounds_work() {
+fn test_all_four_assets_work() {
     let ctx = Ctx::new();
 
+    // BTC
+    ctx.set_price("BTC", ctx.now(), P0);
+    ctx.client().create_round(&Symbol::new(&ctx.env, "BTC"));
+
     // ETH
+    ctx.advance(ORACLE_INTERVAL);
     ctx.set_price("ETH", ctx.now(), 3_000_000_000_000_000_000i128);
     ctx.client().create_round(&Symbol::new(&ctx.env, "ETH"));
 
-    // SOL — advance to get a fresh oracle tick.
+    // SOL
     ctx.advance(ORACLE_INTERVAL);
     ctx.set_price("SOL", ctx.now(), 100_000_000_000_000_000i128);
     ctx.client().create_round(&Symbol::new(&ctx.env, "SOL"));
+
+    // XLM — included because we're building on Stellar and users expect it.
+    // Pool cap to guard against thin-book manipulation is a v2 concern.
+    ctx.advance(ORACLE_INTERVAL);
+    ctx.set_price("XLM", ctx.now(), 130_000_000_000_000i128); // ~$0.13 with 14 decimals
+    ctx.client().create_round(&Symbol::new(&ctx.env, "XLM"));
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════

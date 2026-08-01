@@ -424,10 +424,14 @@ fn require_config(e: &Env) -> Config {
 }
 
 fn require_valid_asset(e: &Env, asset: &Symbol) {
+    // XLM note: Stellar's native asset has thinner order books than BTC/ETH/SOL.
+    // A large pool relative to DEX liquidity could make settlement manipulable.
+    // Mitigate in v2 with a per-round pool cap on XLM rounds.
     let btc = Symbol::new(e, "BTC");
     let eth = Symbol::new(e, "ETH");
     let sol = Symbol::new(e, "SOL");
-    if *asset != btc && *asset != eth && *asset != sol {
+    let xlm = Symbol::new(e, "XLM");
+    if *asset != btc && *asset != eth && *asset != sol && *asset != xlm {
         panic_with_error!(e, Error::InvalidAsset);
     }
 }

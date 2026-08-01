@@ -134,7 +134,7 @@ and documented. Never let them be confused in the code.
 |---|---|---|
 | Last-look betting near settle | **Critical** | 2-min lock buffer; min 90s enforced in contract |
 | Settler picks favourable price | **Critical** | `price(asset, settle_ts)`, never `lastprice()` on settle |
-| XLM as underlying (thin book) | **High** | Excluded in v1 — add in v2 with pool cap |
+| XLM as underlying (thin book) | **Medium** | Included — Stellar's native asset, expected by users. Add a per-round pool cap in v2 to bound manipulation cost |
 | Oracle gap / node outage | Medium | Void + gross refund |
 | One-sided pool self-dealing | Medium | Void when either pool is zero |
 | Rounding drain via dust bets | Low | `min_bet = 10 XLM` enforced |
