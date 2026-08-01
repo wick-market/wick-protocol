@@ -1,6 +1,5 @@
 /**
  * Wick Predict keeper — XLM/USD only.
- * Every 60s: settle if past settle_ts, then create a new round.
  */
 import "dotenv/config";
 import {
@@ -30,8 +29,28 @@ function log(msg: string, data?: Record<string, unknown>) {
   console.log(JSON.stringify({ ts: new Date().toISOString(), msg, ...data }));
 }
 
-async function call(method: string, args: xdr.ScVal[] = []) {
+/** Simulate (read-only) */
+async function query(method: string, args: xdr.ScVal[] = []): Promise<unknown> {
   const account = await server.getAccount(keypair.publicKey());
+  const tx = new TransactionBuilder(account, {
+    fee: BASE_FEE,
+    networkPassphrase: NETWORK_PASSPHRASE,
+  })
+    .addOperation(contract.call(method, ...args))
+    .setTimeout(30)
+    .build();
+  const sim = await server.simulateTransaction(tx);
+  if (!rpc.Api.isSimulationSuccess(sim)) {
+    const e = sim as rpc.Api.SimulateTransactionErrorResponse;
+    throw new Error(`${method}: ${e.error}`);
+  }
+  return scValToNative((sim as rpc.Api.SimulateTransactionSuccessResponse).result!.retval);
+}
+
+/** Simulate → assemble → sign → submit → poll. Returns returnValue or null. */
+async function invoke(method: string, args: xdr.ScVal[] = []): Promise<unknown> {
+  const account = await server.getAccount(keypair.publicKey());
+  // Build ONCE — assemble applies auth/resources to this same transaction.
   const tx = new TransactionBuilder(account, {
     fee: BASE_FEE,
     networkPassphrase: NETWORK_PASSPHRASE,
@@ -43,105 +62,98 @@ async function call(method: string, args: xdr.ScVal[] = []) {
   const sim = await server.simulateTransaction(tx);
   if (!rpc.Api.isSimulationSuccess(sim)) {
     const e = sim as rpc.Api.SimulateTransactionErrorResponse;
-    throw new Error(`sim ${method} failed: ${e.error}`);
+    throw new Error(`${method}: ${e.error}`);
   }
-  return sim as rpc.Api.SimulateTransactionSuccessResponse;
-}
 
-async function invoke(method: string, args: xdr.ScVal[] = []): Promise<xdr.ScVal | undefined> {
-  const sim = await call(method, args);
-  const assembled = rpc.assembleTransaction(
-    // rebuild the tx fresh for signing
-    await (async () => {
-      const account = await server.getAccount(keypair.publicKey());
-      return new TransactionBuilder(account, { fee: BASE_FEE, networkPassphrase: NETWORK_PASSPHRASE })
-        .addOperation(contract.call(method, ...args))
-        .setTimeout(30)
-        .build();
-    })(),
-    sim
-  ).build();
+  const assembled = rpc.assembleTransaction(tx, sim).build();
   assembled.sign(keypair);
   const send = await server.sendTransaction(assembled);
   if (send.status === "ERROR") throw new Error(`send ${method} failed`);
+
   for (let i = 0; i < 30; i++) {
     await new Promise((r) => setTimeout(r, 2000));
     const result = await server.getTransaction(send.hash);
     if (result.status === rpc.Api.GetTransactionStatus.SUCCESS) {
-      return (result as rpc.Api.GetSuccessfulTransactionResponse).returnValue;
+      const rv = (result as rpc.Api.GetSuccessfulTransactionResponse).returnValue;
+      return rv ? scValToNative(rv) : null;
     }
     if (result.status === rpc.Api.GetTransactionStatus.FAILED)
-      throw new Error(`tx ${method} failed on-chain`);
+      throw new Error(`on-chain ${method} failed`);
   }
-  throw new Error(`tx ${method} timed out`);
-}
-
-async function query(method: string, args: xdr.ScVal[] = []): Promise<unknown> {
-  const sim = await call(method, args);
-  return scValToNative(sim.result!.retval);
+  throw new Error(`${method} timed out`);
 }
 
 let currentRoundId = 0n;
 
+async function openNewRound(): Promise<void> {
+  try {
+    const id = await invoke("create_round");
+    currentRoundId = BigInt(id as string | number);
+    log("round created", { id: currentRoundId.toString() });
+  } catch (e: unknown) {
+    const msg = String(e);
+    if (msg.includes("DuplicateRound") || msg.includes("#14")) {
+      log("duplicate — oracle tick unchanged, waiting for next tick");
+    } else {
+      throw e;
+    }
+  }
+}
+
 async function tick() {
   const nowSec = Math.floor(Date.now() / 1000);
 
+  // Discover current round id if we don't know it
   if (currentRoundId === 0n) {
     try {
       const id = await query("current_round_id");
       const n = BigInt(id as string | number);
       if (n > 0n) currentRoundId = n;
-    } catch {
-      /* no rounds yet */
-    }
+    } catch { /* no rounds yet */ }
   }
 
-  if (currentRoundId > 0n) {
-    const round = (await query("get_round", [
-      nativeToScVal(currentRoundId, { type: "u64" }),
-    ])) as Record<string, unknown>;
-
-    const status = (round["status"] as { tag: string }).tag;
-    const settleTs = Number(round["settle_ts"]);
-
-    log("round", { id: currentRoundId.toString(), status, outcome: (round["outcome"] as { tag: string }).tag });
-
-    if (status === "Settled") {
-      log("settled — opening new round");
-      const ret = await invoke("create_round");
-      if (ret) currentRoundId = BigInt(scValToNative(ret) as string | number);
-      log("new round", { id: currentRoundId.toString() });
-      return;
-    }
-
-    if (nowSec >= settleTs) {
-      log("settling", { id: currentRoundId.toString() });
-      try {
-        await invoke("settle", [nativeToScVal(currentRoundId, { type: "u64" })]);
-        log("settled ok", { id: currentRoundId.toString() });
-      } catch (e: unknown) {
-        const msg = String(e);
-        if (msg.includes("AlreadySettled") || msg.includes("#6")) {
-          log("already settled — opening next round immediately");
-          const ret = await invoke("create_round");
-          if (ret) currentRoundId = BigInt(scValToNative(ret) as string | number);
-          log("new round", { id: currentRoundId.toString() });
-        } else throw e;
-      }
-      return;
-    }
-
-    log("live", {
-      secsUntilLock: Math.max(0, Number(round["lock_ts"]) - nowSec),
-      secsUntilSettle: Math.max(0, settleTs - nowSec),
-    });
+  if (currentRoundId === 0n) {
+    log("no rounds yet — creating first");
+    await openNewRound();
     return;
   }
 
-  log("no round — creating first");
-  const ret = await invoke("create_round");
-  if (ret) currentRoundId = BigInt(scValToNative(ret) as string | number);
-  log("created", { id: currentRoundId.toString() });
+  const round = (await query("get_round", [
+    nativeToScVal(currentRoundId, { type: "u64" }),
+  ])) as Record<string, unknown>;
+
+  const status = (round["status"] as { tag: string }).tag;
+  const settleTs = Number(round["settle_ts"]);
+  const outcome = (round["outcome"] as { tag: string }).tag;
+
+  log("round", { id: currentRoundId.toString(), status, outcome, secsLeft: settleTs - nowSec });
+
+  if (status === "Settled") {
+    log("settled — opening next round");
+    await openNewRound();
+    return;
+  }
+
+  if (nowSec >= settleTs) {
+    log("settling", { id: currentRoundId.toString() });
+    try {
+      await invoke("settle", [nativeToScVal(currentRoundId, { type: "u64" })]);
+      log("settled ok");
+      await openNewRound();
+    } catch (e: unknown) {
+      const msg = String(e);
+      if (msg.includes("AlreadySettled") || msg.includes("#6")) {
+        log("already settled — opening next round");
+        await openNewRound();
+      } else throw e;
+    }
+    return;
+  }
+
+  log("live", {
+    secsUntilLock: Math.max(0, Number(round["lock_ts"]) - nowSec),
+    secsUntilSettle: Math.max(0, settleTs - nowSec),
+  });
 }
 
 async function main() {
