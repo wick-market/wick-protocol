@@ -35,7 +35,12 @@ const app = Fastify({ logger: true });
 
 // ── Plugins ───────────────────────────────────────────────────────────────────
 
-await app.register(fastifyCors, { origin: "*" });
+// ALLOWED_ORIGINS is a comma-separated list, e.g. "https://wick-app.vercel.app,http://localhost:3000"
+// Defaults to localhost:3000 so local frontend dev works with no config.
+const allowedOrigins = (process.env.ALLOWED_ORIGINS ?? "http://localhost:3000")
+  .split(",")
+  .map((o) => o.trim());
+await app.register(fastifyCors, { origin: allowedOrigins });
 await app.register(fastifyWebSocket);
 
 // ── WebSocket ─────────────────────────────────────────────────────────────────

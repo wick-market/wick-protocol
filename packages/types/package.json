@@ -1,0 +1,13 @@
+{
+  "name": "@wick/types",
+  "version": "1.0.0",
+  "description": "Generated TypeScript types for the Wick API — do not edit manually",
+  "main": "index.ts",
+  "types": "index.ts",
+  "scripts": {
+    "generate": "openapi-typescript ../../openapi.yaml -o index.ts"
+  },
+  "devDependencies": {
+    "openapi-typescript": "^7.4.0"
+  }
+}

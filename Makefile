@@ -1,4 +1,4 @@
-.PHONY: build test clean deploy-testnet init genesis check-oracle keeper indexer api
+.PHONY: build test clean deploy-testnet init genesis check-oracle keeper indexer api types bindings docker-up
 
 # ── Rust contract ─────────────────────────────────────────────────────────────
 
@@ -40,6 +40,15 @@ indexer:
 
 api:
 	cd api && npm ci && node dist/index.js
+
+types:
+	cd packages/types && npm install && npm run generate
+
+bindings:
+	bash scripts/gen-bindings.sh
+
+docker-up:
+	docker compose up --build
 
 keeper-dev:
 	cd keeper && npm ci && npx ts-node src/index.ts

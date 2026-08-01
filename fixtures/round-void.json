@@ -1,0 +1,16 @@
+{
+  "_comment": "Void because settle_price == strike (exact tie). All positions refunded gross, no fee.",
+  "round_id": "36",
+  "asset": "SOL",
+  "strike": "7289616892463599",
+  "strike_ts": 1785576000,
+  "lock_ts": 1785576180,
+  "settle_ts": 1785576300,
+  "pool_up": "5000000000",
+  "pool_down": "3000000000",
+  "status": "Settled",
+  "outcome": "Void",
+  "settle_price": "7289616892463599",
+  "created_at": "2026-08-01T10:00:00.000Z",
+  "settled_at": "2026-08-01T10:05:01.000Z"
+}

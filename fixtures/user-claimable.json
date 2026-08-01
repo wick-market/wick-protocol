@@ -1,0 +1,30 @@
+[
+  {
+    "_comment": "Bettor A: 1_000_000_000 UP. round 38 settled Up. payout = 1_000_000_000 * 9_800_000_000 / 8_000_000_000 = 1_225_000_000",
+    "round_id": "38",
+    "side": "Up",
+    "amount": "1000000000",
+    "outcome": "Up",
+    "pool_up": "8000000000",
+    "pool_down": "2000000000",
+    "settle_price": "6400000000000000000",
+    "strike": "6303831631126319160",
+    "asset": "BTC",
+    "settle_ts": 1785576900,
+    "claimable": "1225000000"
+  },
+  {
+    "_comment": "Void round 36: gross refund of original stake, no fee",
+    "round_id": "36",
+    "side": "Up",
+    "amount": "500000000",
+    "outcome": "Void",
+    "pool_up": "5000000000",
+    "pool_down": "3000000000",
+    "settle_price": "7289616892463599",
+    "strike": "7289616892463599",
+    "asset": "SOL",
+    "settle_ts": 1785576300,
+    "claimable": "500000000"
+  }
+]

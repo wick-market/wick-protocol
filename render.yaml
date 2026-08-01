@@ -1,0 +1,50 @@
+# Render.com deployment manifest.
+# Deploy: connect this repo in the Render dashboard and it will create
+# two web services (api + indexer) and a Postgres database automatically.
+# Set the env vars marked as "sync: false" in the Render dashboard.
+
+databases:
+  - name: wick-postgres
+    databaseName: wick
+    user: wick
+    plan: free
+
+services:
+  - type: web
+    name: wick-api
+    runtime: node
+    rootDir: api
+    buildCommand: npm install && npx tsc
+    startCommand: node dist/index.js
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: wick-postgres
+          property: connectionString
+      - key: CONTRACT_ID
+        sync: false           # set in Render dashboard
+      - key: FEE_BPS
+        value: "200"          # must match the value passed to contract initialize()
+      - key: API_PORT
+        value: "3000"
+      - key: ALLOWED_ORIGINS
+        sync: false           # set to your frontend URL, e.g. https://wick-app.vercel.app
+
+  - type: worker
+    name: wick-indexer
+    runtime: node
+    rootDir: indexer
+    buildCommand: npm install && npx tsc && node dist/migrate.js
+    startCommand: node dist/index.js
+    plan: free
+    envVars:
+      - key: DATABASE_URL
+        fromDatabase:
+          name: wick-postgres
+          property: connectionString
+      - key: RPC_URL
+        value: https://soroban-testnet.stellar.org
+      - key: CONTRACT_ID
+        sync: false           # set in Render dashboard — same value as wick-api

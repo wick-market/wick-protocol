@@ -1,0 +1,626 @@
+openapi: "3.1.0"
+info:
+  title: Wick Fair Market API
+  version: "1.0.0"
+  description: |
+    Backend API for Wick — a 5-minute binary price prediction market on
+    Stellar/Soroban. Users stake XLM on whether BTC, ETH, SOL, or XLM will
+    close above or below a reference price over a 5-minute window.
+
+    All monetary amounts are returned as **strings** because PostgreSQL NUMERIC
+    and BIGINT types exceed JavaScript's safe integer range (2^53). Parse with
+    BigInt or a decimal library — never with Number().
+
+    The WebSocket endpoint (/ws) is documented under the `x-websocket` extension
+    below, alongside the HTTP endpoints.
+
+servers:
+  - url: http://localhost:3000
+    description: Local development
+  - url: https://wick-api.onrender.com
+    description: Testnet deployment (example)
+
+tags:
+  - name: rounds
+    description: Round lifecycle data — open, locked, settled, void
+  - name: users
+    description: Per-address positions and claimable payouts
+  - name: leaderboard
+    description: Ranked aggregates across users
+  - name: system
+    description: Health and global statistics
+
+paths:
+  /health:
+    get:
+      tags: [system]
+      summary: Health check
+      description: Returns 200 when the API process is alive. Does not check DB connectivity.
+      operationId: getHealth
+      responses:
+        "200":
+          description: API is up
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HealthResponse"
+
+  /api/stats:
+    get:
+      tags: [system]
+      summary: Global statistics
+      description: Aggregate counts across all rounds and assets since contract deployment.
+      operationId: getStats
+      responses:
+        "200":
+          description: Aggregated stats
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StatsResponse"
+
+  /api/rounds/current:
+    get:
+      tags: [rounds]
+      summary: Current active rounds for an asset
+      description: |
+        Returns up to 5 rounds for `asset` that are not yet Settled, ordered by
+        settle_ts ascending. Typically 1–2 rows: one Open (accepting bets) and
+        one Locked (awaiting oracle settlement).
+      operationId: getCurrentRounds
+      parameters:
+        - name: asset
+          in: query
+          required: true
+          description: Asset symbol. One of BTC, ETH, SOL, XLM.
+          schema:
+            $ref: "#/components/schemas/Asset"
+      responses:
+        "200":
+          description: Active rounds
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Round"
+        "400":
+          description: Missing or invalid asset query parameter
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /api/rounds/history:
+    get:
+      tags: [rounds]
+      summary: Settled round history for an asset
+      description: |
+        Returns up to `limit` rounds for `asset`, ordered by settle_ts descending
+        (most recent first). Includes all statuses. Max limit is 200.
+      operationId: getRoundHistory
+      parameters:
+        - name: asset
+          in: query
+          required: true
+          description: Asset symbol. One of BTC, ETH, SOL, XLM.
+          schema:
+            $ref: "#/components/schemas/Asset"
+        - name: limit
+          in: query
+          required: false
+          description: Number of rounds to return. Capped at 200. Defaults to 50.
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 200
+            default: 50
+      responses:
+        "200":
+          description: Historical rounds
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/Round"
+        "400":
+          description: Missing or invalid asset query parameter
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /api/rounds/{id}:
+    get:
+      tags: [rounds]
+      summary: Single round by ID
+      description: Returns a single round record. Useful for polling a specific round's settle status.
+      operationId: getRoundById
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: The on-chain round_id (u64, returned as a string).
+          schema:
+            type: string
+            example: "42"
+      responses:
+        "200":
+          description: Round found
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Round"
+        "404":
+          description: No round with this ID exists in the index
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ErrorResponse"
+
+  /api/users/{address}/positions:
+    get:
+      tags: [users]
+      summary: All positions for a Stellar address
+      description: |
+        Returns the 100 most recent bets placed by `address`, joined with the
+        round's current state. Includes won, lost, pending, and void positions.
+        Check `status` and `outcome` to determine if a position is claimable.
+      operationId: getUserPositions
+      parameters:
+        - name: address
+          in: path
+          required: true
+          description: Stellar G-address of the user.
+          schema:
+            type: string
+            example: "GBGCQGIFNIPDRZ6GN5CFSW5T5KCTGLXDY5HD7ISY6EBDVU7Q2YFBDXUJ"
+      responses:
+        "200":
+          description: List of positions (may be empty)
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/UserPosition"
+
+  /api/users/{address}/claimable:
+    get:
+      tags: [users]
+      summary: Claimable positions for a Stellar address
+      description: |
+        Returns settled positions that have a non-zero payout and have not yet
+        been claimed on-chain. The `claimable` field is the computed payout in
+        stroops using the parimutuel formula. Void rounds return the original
+        staked `amount`.
+
+        Use this endpoint to build the claim queue UI and display the total
+        outstanding XLM the user can collect.
+      operationId: getUserClaimable
+      parameters:
+        - name: address
+          in: path
+          required: true
+          description: Stellar G-address of the user.
+          schema:
+            type: string
+            example: "GBGCQGIFNIPDRZ6GN5CFSW5T5KCTGLXDY5HD7ISY6EBDVU7Q2YFBDXUJ"
+      responses:
+        "200":
+          description: Claimable positions (may be empty if nothing is owed)
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/ClaimablePosition"
+
+  /api/leaderboard:
+    get:
+      tags: [leaderboard]
+      summary: Top users by net P&L
+      description: |
+        Returns the top 100 users ranked by net P&L (`total_won - total_staked`)
+        over the requested time window. Sourced from a materialised view refreshed
+        roughly every 10 minutes.
+
+        Note: leaderboard rows read from the `leaderboard` materialised view for
+        the all-time window; live SQL for time-windowed queries.
+      operationId: getLeaderboard
+      parameters:
+        - name: window
+          in: query
+          required: false
+          description: Time window. One of 24h, 7d, 30d. Defaults to 7d.
+          schema:
+            type: string
+            enum: [24h, 7d, 30d]
+            default: 7d
+      responses:
+        "200":
+          description: Leaderboard entries
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/LeaderboardEntry"
+
+  /ws:
+    get:
+      tags: [system]
+      summary: WebSocket — live round state and indicative prices
+      description: |
+        Upgrade this connection to WebSocket. The server pushes messages without
+        the client sending anything. Three message types are emitted:
+
+        **connected** — sent immediately on connection.
+
+        **round** — emitted every 5 seconds for every non-Settled round. Use
+        this to drive countdown timers and live pool displays. Do not use the
+        server clock from this message as the canonical time source; use the
+        `settle_ts` and `lock_ts` fields.
+
+        **price** — emitted as Binance miniTicker ticks arrive (approximately
+        every second). This is the *indicative* display price sourced from a
+        CEX. It is **not** the settlement price. Settlement reads
+        `oracle.price(asset, settle_ts)` from Reflector — a separate source
+        that will differ slightly. Never confuse the two in UI copy.
+      operationId: websocket
+      responses:
+        "101":
+          description: Switching Protocols — WebSocket upgrade accepted
+
+# ── WebSocket message schemas (x-websocket extension) ────────────────────────
+x-websocket-messages:
+  ConnectedMessage:
+    description: Sent once on connection establishment.
+    schema:
+      $ref: "#/components/schemas/WsConnected"
+  RoundMessage:
+    description: Full round state, pushed every 5 seconds for every open/locked round.
+    schema:
+      $ref: "#/components/schemas/WsRound"
+  PriceMessage:
+    description: Indicative CEX price tick (Binance). NOT the settlement price.
+    schema:
+      $ref: "#/components/schemas/WsPrice"
+
+components:
+  schemas:
+
+    # ── Enums ──────────────────────────────────────────────────────────────────
+
+    Asset:
+      type: string
+      enum: [BTC, ETH, SOL, XLM]
+      description: Prediction market asset. XLM prices are from the Reflector USD-base oracle.
+
+    RoundStatus:
+      type: string
+      enum: [Open, Locked, Settled]
+      description: |
+        Open — bets accepted until lock_ts.
+        Locked — no new bets; awaiting the oracle tick at settle_ts.
+        Settled — outcome determined; winners may claim.
+
+    Outcome:
+      type: string
+      enum: [Up, Down, Void]
+      nullable: true
+      description: |
+        Up — settle_price > strike.
+        Down — settle_price < strike.
+        Void — exact tie, empty pool on either side, or oracle gap.
+          Void rounds refund the gross staked amount with no fee deducted.
+        Null when the round is not yet Settled.
+
+    Side:
+      type: string
+      enum: [Up, Down]
+      description: Which direction the user bet on.
+
+    # ── Core objects ───────────────────────────────────────────────────────────
+
+    Round:
+      type: object
+      required:
+        - round_id
+        - asset
+        - strike
+        - strike_ts
+        - lock_ts
+        - settle_ts
+        - pool_up
+        - pool_down
+        - status
+        - created_at
+      properties:
+        round_id:
+          type: string
+          description: On-chain u64 ID, returned as a string to preserve precision.
+          example: "42"
+        asset:
+          $ref: "#/components/schemas/Asset"
+        strike:
+          type: string
+          description: |
+            Oracle price at round open (P_N). Raw i128 with 14 decimal places.
+            Actual USD price = strike / 10^14. Used as the reference to compare
+            against settle_price. Bettors are predicting whether the next oracle
+            tick will be above or below this value.
+          example: "6303831631126319160"
+        strike_ts:
+          type: integer
+          format: int64
+          description: Unix timestamp (seconds) of the oracle tick that produced the strike. Derived from oracle.lastprice().timestamp — NOT from the ledger clock.
+          example: 1785577800
+        lock_ts:
+          type: integer
+          format: int64
+          description: Unix timestamp (seconds) after which bets are rejected. Equal to strike_ts + lock_offset (default 180s).
+          example: 1785577980
+        settle_ts:
+          type: integer
+          format: int64
+          description: Unix timestamp (seconds) at which oracle.price(asset, settle_ts) is read for settlement. Equal to strike_ts + 300.
+          example: 1785578100
+        pool_up:
+          type: string
+          description: Total XLM staked on Up in stroops (1 XLM = 10,000,000 stroops). Updated on every Bet event.
+          example: "8000000000"
+        pool_down:
+          type: string
+          description: Total XLM staked on Down in stroops.
+          example: "2000000000"
+        status:
+          $ref: "#/components/schemas/RoundStatus"
+        outcome:
+          $ref: "#/components/schemas/Outcome"
+        settle_price:
+          type: string
+          nullable: true
+          description: Oracle price at settle_ts (P_(N+1)). Null until Settled. Same 14-decimal encoding as strike.
+          example: "6400000000000000000"
+        created_at:
+          type: string
+          format: date-time
+          description: When the indexer first recorded this round.
+        settled_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: When the indexer recorded the Settled event. Null until settled.
+
+    UserPosition:
+      type: object
+      description: A bet joined with its round's current state.
+      required:
+        - id
+        - tx_hash
+        - event_index
+        - round_id
+        - user_addr
+        - side
+        - amount
+        - placed_at
+        - asset
+        - status
+        - settle_ts
+        - pool_up
+        - pool_down
+        - strike
+      properties:
+        id:
+          type: integer
+          description: Internal database ID of the bet row.
+        tx_hash:
+          type: string
+          description: Stellar transaction hash of the bet transaction.
+        event_index:
+          type: integer
+          description: Index of the Bet event within the transaction.
+        round_id:
+          type: string
+          description: On-chain round ID this bet is for.
+          example: "42"
+        user_addr:
+          type: string
+          description: Stellar G-address of the bettor.
+        side:
+          $ref: "#/components/schemas/Side"
+        amount:
+          type: string
+          description: Amount staked in stroops.
+          example: "1000000000"
+        placed_at:
+          type: string
+          format: date-time
+        asset:
+          $ref: "#/components/schemas/Asset"
+        status:
+          $ref: "#/components/schemas/RoundStatus"
+        outcome:
+          $ref: "#/components/schemas/Outcome"
+        settle_ts:
+          type: integer
+          format: int64
+        pool_up:
+          type: string
+        pool_down:
+          type: string
+        strike:
+          type: string
+        settle_price:
+          type: string
+          nullable: true
+
+    ClaimablePosition:
+      type: object
+      description: A settled position with a non-zero unclaimed payout.
+      required:
+        - round_id
+        - side
+        - amount
+        - outcome
+        - pool_up
+        - pool_down
+        - strike
+        - asset
+        - settle_ts
+        - claimable
+      properties:
+        round_id:
+          type: string
+          example: "42"
+        side:
+          $ref: "#/components/schemas/Side"
+        amount:
+          type: string
+          description: Original amount staked in stroops.
+          example: "1000000000"
+        outcome:
+          $ref: "#/components/schemas/Outcome"
+        pool_up:
+          type: string
+          example: "8000000000"
+        pool_down:
+          type: string
+          example: "2000000000"
+        settle_price:
+          type: string
+          nullable: true
+        strike:
+          type: string
+        asset:
+          $ref: "#/components/schemas/Asset"
+        settle_ts:
+          type: integer
+          format: int64
+        claimable:
+          type: string
+          description: |
+            Computed payout in stroops using the parimutuel formula:
+              distributed = (pool_up + pool_down) * (10000 - fee_bps) / 10000
+              payout = amount * distributed / winning_pool
+            For Void rounds: claimable = amount (gross refund, no fee).
+
+    LeaderboardEntry:
+      type: object
+      required:
+        - user_addr
+        - rounds_entered
+        - total_won
+        - total_staked
+        - net_pnl
+      properties:
+        user_addr:
+          type: string
+          description: Stellar G-address.
+        rounds_entered:
+          type: string
+          description: Distinct rounds bet on within the time window.
+          example: "24"
+        total_won:
+          type: string
+          description: Total stroops received from winning claims.
+          example: "15400000000"
+        total_staked:
+          type: string
+          description: Total stroops placed as bets.
+          example: "12000000000"
+        net_pnl:
+          type: string
+          description: total_won − total_staked in stroops. Can be negative.
+          example: "3400000000"
+
+    StatsResponse:
+      type: object
+      required:
+        - total_rounds
+        - settled_rounds
+        - total_volume
+        - active_assets
+      properties:
+        total_rounds:
+          type: string
+          description: All rounds ever indexed.
+          example: "288"
+        settled_rounds:
+          type: string
+          description: Rounds with status = Settled.
+          example: "276"
+        total_volume:
+          type: string
+          description: Sum of pool_up + pool_down across all rounds, in stroops.
+          example: "2880000000000"
+        active_assets:
+          type: string
+          description: Count of distinct assets that have at least one round.
+          example: "4"
+
+    HealthResponse:
+      type: object
+      required: [ok, ts]
+      properties:
+        ok:
+          type: boolean
+          example: true
+        ts:
+          type: integer
+          description: Server Unix timestamp in milliseconds.
+          example: 1785577900000
+
+    ErrorResponse:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+          example: "asset required"
+
+    # ── WebSocket message schemas ──────────────────────────────────────────────
+
+    WsConnected:
+      type: object
+      required: [type]
+      properties:
+        type:
+          type: string
+          enum: [connected]
+          description: Sent once immediately after the WebSocket handshake.
+
+    WsRound:
+      type: object
+      required: [type, data]
+      properties:
+        type:
+          type: string
+          enum: [round]
+        data:
+          $ref: "#/components/schemas/Round"
+          description: Current state of a non-Settled round. Emitted every 5 seconds per round.
+
+    WsPrice:
+      type: object
+      required: [type, asset, price, ts]
+      properties:
+        type:
+          type: string
+          enum: [price]
+        asset:
+          $ref: "#/components/schemas/Asset"
+        price:
+          type: string
+          description: |
+            Indicative USD price string from Binance miniTicker (field `c` = close).
+            This is the DISPLAY price for the UI chart.
+            It is NOT the settlement price — settlement uses oracle.price(asset, settle_ts)
+            from Reflector, which will differ. Do not use this for any payout calculation.
+          example: "63412.50"
+        ts:
+          type: integer
+          description: Server-side Date.now() in milliseconds when the tick was received.
+          example: 1785577912345

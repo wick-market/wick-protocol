@@ -1,0 +1,65 @@
+services:
+
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: wick
+      POSTGRES_USER: wick
+      POSTGRES_PASSWORD: wick_dev          # dev-only password — never use in production
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U wick"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  migrate:
+    build:
+      context: ./indexer
+    command: node dist/migrate.js
+    environment:
+      DATABASE_URL: postgres://wick:wick_dev@postgres:5432/wick
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  indexer:
+    build:
+      context: ./indexer
+    environment:
+      # Soroban RPC endpoint (testnet)
+      RPC_URL: ${RPC_URL:-https://soroban-testnet.stellar.org}
+      # Deployed fair-market contract ID
+      CONTRACT_ID: ${CONTRACT_ID}
+      # Postgres connection string
+      DATABASE_URL: postgres://wick:wick_dev@postgres:5432/wick
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+  api:
+    build:
+      context: ./api
+    ports:
+      - "${API_PORT:-3000}:3000"
+    environment:
+      # Postgres connection string
+      DATABASE_URL: postgres://wick:wick_dev@postgres:5432/wick
+      # Port the API listens on inside the container
+      API_PORT: 3000
+      # Fee basis points — must match what was passed to initialize()
+      FEE_BPS: ${FEE_BPS:-200}
+      # Comma-separated allowed CORS origins
+      # Add your frontend URL here, e.g. https://wick-app.vercel.app
+      ALLOWED_ORIGINS: ${ALLOWED_ORIGINS:-http://localhost:3000}
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+volumes:
+  pg_data:

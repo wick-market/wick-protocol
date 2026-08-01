@@ -2,9 +2,9 @@
  * WebSocket hub — broadcasts live round state to all connected clients.
  *
  * Messages pushed to clients:
- *   { type: "round",  data: Round }          round state update
+ *   { type: "connected" }                    sent on initial connection
+ *   { type: "round",  data: Round }          round state update (every 5 s)
  *   { type: "price",  asset, price, ts }     indicative CEX price tick
- *   { type: "pools",  round_id, pool_up, pool_down } pool size update
  *
  * CRITICAL SEPARATION: the "price" message is sourced from Binance WebSocket
  * (smooth, real-time). The settlement price comes from the Reflector oracle
@@ -40,6 +40,7 @@ const BINANCE_SYMBOLS: Record<string, string> = {
   BTC: "btcusdt",
   ETH: "ethusdt",
   SOL: "solusdt",
+  XLM: "xlmusdt",
 };
 
 export function startPriceTicker() {

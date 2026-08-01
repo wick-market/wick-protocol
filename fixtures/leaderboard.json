@@ -1,0 +1,23 @@
+[
+  {
+    "user_addr": "GBGCQGIFNIPDRZ6GN5CFSW5T5KCTGLXDY5HD7ISY6EBDVU7Q2YFBDXUJ",
+    "rounds_entered": "24",
+    "total_won": "15400000000",
+    "total_staked": "12000000000",
+    "net_pnl": "3400000000"
+  },
+  {
+    "user_addr": "GDRFA6KPTMJFSM4KMFVNKMNKR4JWQN4KZHBCJ7KYPTVUDWPNXWFB4MTC",
+    "rounds_entered": "18",
+    "total_won": "8200000000",
+    "total_staked": "9000000000",
+    "net_pnl": "-800000000"
+  },
+  {
+    "user_addr": "GCEZWKCA5VLDNRLN3RPRJMRZOX3Z6G5CHCGWKX2ZVKK8M43CNVSJ2PQN",
+    "rounds_entered": "31",
+    "total_won": "22100000000",
+    "total_staked": "21800000000",
+    "net_pnl": "300000000"
+  }
+]
