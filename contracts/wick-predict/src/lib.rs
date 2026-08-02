@@ -35,9 +35,8 @@ use soroban_sdk::{
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-const ORACLE_INTERVAL: u64 = 300;
 const MAX_FEE_BPS: u32 = 500;
-const MIN_LOCK_OFFSET: u64 = 90;
+const MIN_LOCK_OFFSET: u64 = 10; // lowered so test oracle can use short rounds
 // Ninetails split: 70% winner-side bonus, 30% early-entry refund (all participants)
 const NINETAILS_WINNER_PCT: i128 = 7_000; // 70% of 10_000
 const NINETAILS_REFUND_PCT: i128 = 3_000; // 30% of 10_000
@@ -146,6 +145,8 @@ pub struct Config {
     pub min_bet: i128,
     pub lock_offset: u64,
     pub oracle_decimals: u32,
+    /// Seconds between oracle updates. Reflector=300, test oracle=60.
+    pub oracle_interval: u64,
 }
 
 // ── Oracle client ─────────────────────────────────────────────────────────────
@@ -308,6 +309,7 @@ impl WickPredict {
         fee_bps: u32,
         min_bet: i128,
         lock_offset: u64,
+        oracle_interval: u64,
     ) {
         if e.storage().instance().has(&Key::Config) {
             panic_with_error!(&e, Error::AlreadyInitialized);
@@ -320,6 +322,7 @@ impl WickPredict {
         e.storage().instance().set(&Key::Config, &Config {
             admin, oracle, token, fee_bps, min_bet, lock_offset,
             oracle_decimals: decimals,
+            oracle_interval,
         });
         e.storage().instance().set(&Key::Counter, &0u64);
         e.storage().instance().set(&Key::Fees, &0i128);
@@ -345,7 +348,7 @@ impl WickPredict {
             strike: tick.price,
             strike_ts,
             lock_ts: strike_ts + config.lock_offset,
-            settle_ts: strike_ts + ORACLE_INTERVAL,
+            settle_ts: strike_ts + config.oracle_interval,
             pool_above: 0,
             pool_below: 0,
             boosted_above: 0,
@@ -661,7 +664,7 @@ mod tests {
             let oracle = env.register(MockOracle, ());
             let token = env.register_stellar_asset_contract_v2(admin.clone()).address();
             let c = env.register(WickPredict, ());
-            WickPredictClient::new(&env, &c).initialize(&admin, &oracle, &token, &FEE, &MIN, &LOCK);
+            WickPredictClient::new(&env, &c).initialize(&admin, &oracle, &token, &FEE, &MIN, &LOCK, &300u64);
             Ctx { env, c, oracle, token, admin }
         }
         fn client(&self) -> WickPredictClient { WickPredictClient::new(&self.env, &self.c) }
