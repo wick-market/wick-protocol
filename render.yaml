@@ -33,6 +33,19 @@ services:
         sync: false           # set to your frontend URL, e.g. https://wick-app.vercel.app
 
   - type: worker
+    name: wick-xlm-keeper
+    runtime: node
+    rootDir: keeper
+    buildCommand: npm install
+    startCommand: node_modules/.bin/ts-node src/xlm-keeper.ts
+    plan: free
+    envVars:
+      - key: XLM_PREDICT_CONTRACT_ID
+        value: "CB6PWNWBO5BTWVAYFWUZ4PG3X6LHSZNBUQG7A6AK2TNCMKY72LRQIPCC"
+      - key: ADMIN_SECRET
+        sync: false           # paste the S... secret key in Render dashboard — keep secret
+
+  - type: worker
     name: wick-indexer
     runtime: node
     rootDir: indexer
