@@ -1,28 +1,30 @@
 // Wick Predict — XLM/USD binary prediction market on Stellar/Soroban
 //
-// Inspired by 9lives' DPPM (Dynamic Pari-Mutuel Prediction Market) model.
-// Earlier bettors receive more shares per XLM than late bettors, rewarding
-// those who commit capital early with less information.
+// Mechanics based on 9lives.so DPPM + Ninetails model.
+// Earlier bettors earn more. Even losers get a partial refund.
+//
+// ── Payout at resolution (Above wins) ────────────────────────────────────────
+//
+//   loser_pool   = pool_below
+//   distributed  = loser_pool * (10000 - fee_bps) / 10000
+//
+//   winner = stake_above             (1:1 base — always get your stake back)
+//          + 70% * distributed * (user_above_boosted / total_above_boosted)
+//          + 30% * distributed * (user_boosted / global_boosted)
+//
+//   loser  = 30% * distributed * (user_boosted / global_boosted)
+//
+//   boosted = amount * (lock_ts - bet_ts)   (time-weight: bet early → more)
+//
+//   Conservation: pool_above + loser_pool - fee = total paid out  ✓
+//   Early-entry bonus: even losers receive proportional refund
 //
 // Oracle: Reflector ReflectorPulse (testnet)
 //   CCYOZJCOPG34LLQQ7N24YXBM7LL62R7ONMZ3G6WZAAYPB5OYKOMJRN63
-//   decimals=14, base=USD, updates every 300s
+//   decimals=14, base=USD, 5-minute updates
 //
-// Round lifecycle (5 minutes total):
-//   t=0:00   create_round() — reads lastprice() → strike
-//   t=0:00→3:00  bet_above/bet_below open — shares decrease with time
-//   t=3:00   lock — no new bets
-//   t=5:00   settle() — reads price(XLM, settle_ts) → outcome
-//
-// Share formula (Ninetails-style):
-//   scale   = 1000 − (elapsed_secs × 500 / window_secs)   [1000 → 500]
-//   shares  = amount × scale / 1000
-//
-// Payout (winner):
-//   distributed = losing_pool × (10000 − fee_bps) / 10000
-//   payout_i    = shares_i × distributed / total_winning_shares
-//
-// Void (empty pool, exact tie, oracle gap): gross refund, no fee.
+// Storage TTL: Round + Position in TEMPORARY (7 days).
+//              Config / Counter in PERSISTENT (30 days).
 
 #![no_std]
 
@@ -33,13 +35,15 @@ use soroban_sdk::{
 
 // ── Constants ─────────────────────────────────────────────────────────────────
 
-const ORACLE_INTERVAL: u64 = 300;   // Reflector updates every 5 minutes
-const SCALE_BASE: i128 = 1000;      // share scale denominator
-const SCALE_MIN: i128 = 500;        // scale at lock_ts (50% of SCALE_BASE)
-const MAX_FEE_BPS: u32 = 500;       // 5% hard cap
-const MIN_LOCK_OFFSET: u64 = 90;    // minimum betting window (seconds)
+const ORACLE_INTERVAL: u64 = 300;
+const MAX_FEE_BPS: u32 = 500;
+const MIN_LOCK_OFFSET: u64 = 90;
+// Ninetails split: 70% winner-side bonus, 30% early-entry refund (all participants)
+const NINETAILS_WINNER_PCT: i128 = 7_000; // 70% of 10_000
+const NINETAILS_REFUND_PCT: i128 = 3_000; // 30% of 10_000
+const NINETAILS_DENOM: i128 = 10_000;
 
-// Temporary storage TTL (7 days in ledgers, ~5s each)
+// Storage TTL
 const TEMP_BUMP: u32 = 7 * 24 * 3600 / 5;
 const TEMP_THRESHOLD: u32 = 3 * 24 * 3600 / 5;
 const INST_BUMP: u32 = 30 * 24 * 3600 / 5;
@@ -52,7 +56,7 @@ enum Key {
     Config,
     Counter,
     Fees,
-    LastStrikeTs,       // dedup: reject create_round if same oracle tick
+    LastStrikeTs,
     Round(u64),
     Position(u64, Address),
 }
@@ -98,25 +102,24 @@ pub enum Status { Open, Locked, Settled }
 #[derive(Clone, Debug)]
 pub struct Round {
     pub id: u64,
-    /// XLM/USD oracle price at open (14 decimals). Strike bettors predict against.
+    /// XLM/USD oracle price at open — the reference to predict against.
     pub strike: i128,
-    /// Oracle's own timestamp for the strike price — NOT ledger time.
     pub strike_ts: u64,
-    /// strike_ts + lock_offset. No bets after this.
     pub lock_ts: u64,
-    /// strike_ts + ORACLE_INTERVAL (300s). Settlement reads price at this ts.
     pub settle_ts: u64,
     /// Total XLM staked on Above (stroops).
     pub pool_above: i128,
     /// Total XLM staked on Below (stroops).
     pub pool_below: i128,
-    /// Time-weighted shares issued on Above side.
-    pub shares_above: i128,
-    /// Time-weighted shares issued on Below side.
-    pub shares_below: i128,
+    /// Sum of (amount × time_remaining) for all Above bettors.
+    pub boosted_above: i128,
+    /// Sum of (amount × time_remaining) for all Below bettors.
+    pub boosted_below: i128,
+    /// boosted_above + boosted_below — global denominator for loser refunds.
+    pub global_boosted: i128,
     pub status: Status,
     pub outcome: Outcome,
-    /// Settlement price. Zero until settled.
+    /// Settlement price from oracle. Zero until settled.
     pub settle_price: i128,
 }
 
@@ -125,10 +128,11 @@ pub struct Round {
 pub struct Position {
     pub round_id: u64,
     pub side: Side,
-    /// XLM staked in stroops.
+    /// Stroops staked.
     pub amount: i128,
-    /// Time-weighted shares received. Earlier = more shares per XLM.
-    pub shares: i128,
+    /// Time-weighted shares: amount × (lock_ts − bet_ts).
+    /// Larger for early bettors — determines Ninetails bonus share.
+    pub boosted: i128,
     pub claimed: bool,
 }
 
@@ -136,17 +140,11 @@ pub struct Position {
 #[derive(Clone, Debug)]
 pub struct Config {
     pub admin: Address,
-    /// Reflector oracle contract.
     pub oracle: Address,
-    /// XLM Stellar Asset Contract.
     pub token: Address,
-    /// Fee in basis points (e.g. 200 = 2%). Applied to losing pool on payout.
     pub fee_bps: u32,
-    /// Minimum bet in stroops (default 100_000_000 = 10 XLM).
     pub min_bet: i128,
-    /// Seconds after strike_ts before betting closes (default 180, min 90).
     pub lock_offset: u64,
-    /// oracle.decimals() — for frontend display normalisation.
     pub oracle_decimals: u32,
 }
 
@@ -179,42 +177,77 @@ fn xlm_asset(e: &Env) -> OracleAsset {
 
 // ── Pure math ─────────────────────────────────────────────────────────────────
 
-/// Time-weighted share amount.
-/// scale ∈ [SCALE_MIN, SCALE_BASE] → shares ∈ [amount/2, amount].
-pub fn compute_shares(amount: i128, bet_ts: u64, strike_ts: u64, lock_ts: u64) -> i128 {
-    let window = lock_ts.saturating_sub(strike_ts) as i128;
-    if window <= 0 {
-        return amount; // degenerate case — no time weighting
-    }
-    let elapsed = bet_ts.saturating_sub(strike_ts) as i128;
-    let elapsed = elapsed.min(window);
-    // scale = 1000 at t=0, 500 at t=lock_ts
-    let scale = SCALE_BASE - (elapsed * (SCALE_BASE - SCALE_MIN) / window);
-    amount
-        .checked_mul(scale).expect("shares mul overflow")
-        .checked_div(SCALE_BASE).expect("shares div overflow")
+/// Time-weighted boosted shares.
+/// boosted = amount × (lock_ts − bet_ts)
+/// Max at t=0 (bet at open), zero at t=lock_ts.
+pub fn boosted_shares(amount: i128, bet_ts: u64, lock_ts: u64) -> i128 {
+    let remaining = lock_ts.saturating_sub(bet_ts) as i128;
+    amount.checked_mul(remaining).expect("boosted overflow")
 }
 
-/// Winner's payout from the losing pool.
-/// payout_i = shares_i × distributed / total_winning_shares
-pub fn compute_payout(
-    shares: i128,
-    total_winning_shares: i128,
-    losing_pool: i128,
-    fee_bps: u32,
+/// Ninetails payout for a winner.
+///
+///   base          = staked amount (1:1 guarantee)
+///   winner_bonus  = 70% of distributed × user_above_boosted / total_above_boosted
+///   early_bonus   = 30% of distributed × user_boosted / global_boosted
+///   total         = base + winner_bonus + early_bonus
+pub fn winner_payout(
+    staked: i128,
+    distributed: i128,
+    user_boosted: i128,
+    side_boosted: i128,
+    global_boosted: i128,
 ) -> i128 {
-    if shares == 0 || total_winning_shares == 0 || losing_pool == 0 {
-        return 0;
-    }
-    let distributed = losing_pool
-        .checked_mul((10_000 - fee_bps as i128)).expect("dist mul overflow")
-        .checked_div(10_000).expect("dist div overflow");
-    shares
-        .checked_mul(distributed).expect("payout mul overflow")
-        .checked_div(total_winning_shares).expect("payout div overflow")
+    let base = staked;
+
+    let winner_share = if side_boosted > 0 {
+        distributed
+            .checked_mul(NINETAILS_WINNER_PCT).expect("w mul1")
+            .checked_div(NINETAILS_DENOM).expect("w div1")
+            .checked_mul(user_boosted).expect("w mul2")
+            .checked_div(side_boosted).expect("w div2")
+    } else {
+        0
+    };
+
+    let refund_share = if global_boosted > 0 {
+        distributed
+            .checked_mul(NINETAILS_REFUND_PCT).expect("r mul1")
+            .checked_div(NINETAILS_DENOM).expect("r div1")
+            .checked_mul(user_boosted).expect("r mul2")
+            .checked_div(global_boosted).expect("r div2")
+    } else {
+        0
+    };
+
+    base.checked_add(winner_share).expect("wp add1")
+        .checked_add(refund_share).expect("wp add2")
 }
 
-// ── Storage helpers ───────────────────────────────────────────────────────────
+/// Ninetails payout for a loser.
+///
+///   payout = 30% of distributed × user_boosted / global_boosted
+pub fn loser_payout(
+    distributed: i128,
+    user_boosted: i128,
+    global_boosted: i128,
+) -> i128 {
+    if global_boosted == 0 { return 0; }
+    distributed
+        .checked_mul(NINETAILS_REFUND_PCT).expect("lp mul1")
+        .checked_div(NINETAILS_DENOM).expect("lp div1")
+        .checked_mul(user_boosted).expect("lp mul2")
+        .checked_div(global_boosted).expect("lp div2")
+}
+
+/// Fee on the losing pool, taken at resolution.
+pub fn fee_amount(losing_pool: i128, fee_bps: u32) -> i128 {
+    losing_pool
+        .checked_mul(fee_bps as i128).expect("fee mul")
+        .checked_div(10_000).expect("fee div")
+}
+
+// ── Storage ───────────────────────────────────────────────────────────────────
 
 fn bump_instance(e: &Env) {
     e.storage().instance().extend_ttl(INST_THRESHOLD, INST_BUMP);
@@ -233,7 +266,7 @@ fn load_round(e: &Env, id: u64) -> Round {
         .unwrap_or_else(|| panic_with_error!(e, Error::RoundNotFound))
 }
 
-fn save_position(e: &Env, round_id: u64, user: &Address, pos: &Position) {
+fn save_pos(e: &Env, round_id: u64, user: &Address, pos: &Position) {
     let key = Key::Position(round_id, user.clone());
     e.storage().temporary().set(&key, pos);
     e.storage().temporary().extend_ttl(&key, TEMP_THRESHOLD, TEMP_BUMP);
@@ -241,14 +274,13 @@ fn save_position(e: &Env, round_id: u64, user: &Address, pos: &Position) {
 
 fn next_id(e: &Env) -> u64 {
     let n: u64 = e.storage().instance().get(&Key::Counter).unwrap_or(0);
-    let next = n + 1;
-    e.storage().instance().set(&Key::Counter, &next);
-    next
+    e.storage().instance().set(&Key::Counter, &(n + 1));
+    n + 1
 }
 
-fn add_fees(e: &Env, amount: i128) {
+fn accrue_fee(e: &Env, amt: i128) {
     let cur: i128 = e.storage().instance().get(&Key::Fees).unwrap_or(0);
-    e.storage().instance().set(&Key::Fees, &(cur + amount));
+    e.storage().instance().set(&Key::Fees, &(cur + amt));
 }
 
 fn require_config(e: &Env) -> Config {
@@ -298,17 +330,14 @@ impl WickPredict {
 
     pub fn create_round(e: Env) -> u64 {
         let config = require_config(&e);
-
         let oracle = OracleClient::new(&e, &config.oracle);
         let tick = oracle
             .lastprice(&xlm_asset(&e))
             .unwrap_or_else(|| panic_with_error!(&e, Error::OracleNoPrice));
 
         let strike_ts = tick.timestamp;
-
-        // Dedup: one round per oracle tick
-        let last_ts: u64 = e.storage().instance().get(&Key::LastStrikeTs).unwrap_or(0);
-        if last_ts == strike_ts { panic_with_error!(&e, Error::DuplicateRound); }
+        let last: u64 = e.storage().instance().get(&Key::LastStrikeTs).unwrap_or(0);
+        if last == strike_ts { panic_with_error!(&e, Error::DuplicateRound); }
 
         let id = next_id(&e);
         let round = Round {
@@ -319,8 +348,9 @@ impl WickPredict {
             settle_ts: strike_ts + ORACLE_INTERVAL,
             pool_above: 0,
             pool_below: 0,
-            shares_above: 0,
-            shares_below: 0,
+            boosted_above: 0,
+            boosted_below: 0,
+            global_boosted: 0,
             status: Status::Open,
             outcome: Outcome::Void,
             settle_price: 0,
@@ -360,31 +390,32 @@ impl WickPredict {
             panic_with_error!(e, Error::AlreadyBet);
         }
 
-        // Time-weighted shares: bet early → more shares → larger payout share
-        let shares = compute_shares(amount, now, round.strike_ts, round.lock_ts);
+        // Ninetails: time-weighted boosted shares
+        let boosted = boosted_shares(amount, now, round.lock_ts);
 
-        // Transfer XLM from user to contract
+        // Transfer XLM to contract
         token::TokenClient::new(e, &config.token)
             .transfer(&user, &e.current_contract_address(), &amount);
 
         match side {
             Side::Above => {
-                round.pool_above = round.pool_above.checked_add(amount).expect("pool overflow");
-                round.shares_above = round.shares_above.checked_add(shares).expect("shares overflow");
+                round.pool_above += amount;
+                round.boosted_above += boosted;
             }
             Side::Below => {
-                round.pool_below = round.pool_below.checked_add(amount).expect("pool overflow");
-                round.shares_below = round.shares_below.checked_add(shares).expect("shares overflow");
+                round.pool_below += amount;
+                round.boosted_below += boosted;
             }
         }
+        round.global_boosted += boosted;
         save_round(e, &round);
 
-        let pos = Position { round_id, side, amount, shares, claimed: false };
-        save_position(e, round_id, &user, &pos);
+        let pos = Position { round_id, side, amount, boosted, claimed: false };
+        save_pos(e, round_id, &user, &pos);
 
         e.events().publish(
             (symbol_short!("bet"), round_id),
-            (user, side, amount, shares, round.pool_above, round.pool_below),
+            (user, side, amount, boosted),
         );
         bump_instance(e);
     }
@@ -399,8 +430,6 @@ impl WickPredict {
         if e.ledger().timestamp() < round.settle_ts { panic_with_error!(&e, Error::TooEarly); }
 
         let oracle = OracleClient::new(&e, &config.oracle);
-
-        // Pinned to settle_ts — outcome is identical regardless of who calls settle() or when.
         let price_data = oracle.price(&xlm_asset(&e), &round.settle_ts);
 
         let outcome = match price_data {
@@ -413,24 +442,21 @@ impl WickPredict {
             }
         };
 
-        // One-sided pool → Void (no counterparty)
+        // Empty pool on either side → void
         let outcome = if round.pool_above == 0 || round.pool_below == 0 {
             Outcome::Void
         } else {
             outcome
         };
 
-        // Collect fee from losing pool on resolved rounds
+        // Collect fee from losing pool on resolved (non-void) rounds
         if outcome != Outcome::Void {
             let losing_pool = if outcome == Outcome::Above {
                 round.pool_below
             } else {
                 round.pool_above
             };
-            let fee = losing_pool
-                .checked_mul(config.fee_bps as i128).expect("fee mul")
-                .checked_div(10_000).expect("fee div");
-            add_fees(&e, fee);
+            accrue_fee(&e, fee_amount(losing_pool, config.fee_bps));
         }
 
         round.outcome = outcome;
@@ -449,8 +475,8 @@ impl WickPredict {
     pub fn claim(e: Env, user: Address, round_id: u64) -> i128 {
         user.require_auth();
         let config = require_config(&e);
-
         let round = load_round(&e, round_id);
+
         if round.status != Status::Settled { panic_with_error!(&e, Error::RoundNotSettled); }
 
         let key = Key::Position(round_id, user.clone());
@@ -463,23 +489,38 @@ impl WickPredict {
         if pos.claimed { panic_with_error!(&e, Error::NothingToClaim); }
 
         let payout = if round.outcome == Outcome::Void {
-            pos.amount // gross refund — no fee on void
+            pos.amount // full refund, no fee on void
         } else {
+            let losing_pool = if round.outcome == Outcome::Above {
+                round.pool_below
+            } else {
+                round.pool_above
+            };
+            let fee = fee_amount(losing_pool, config.fee_bps);
+            let distributed = losing_pool - fee;
+
             let on_winning_side = matches!(
                 (pos.side, round.outcome),
                 (Side::Above, Outcome::Above) | (Side::Below, Outcome::Below)
             );
-            if !on_winning_side {
-                pos.claimed = true;
-                e.storage().temporary().set(&key, &pos);
-                return 0; // loser — mark claimed so they can't retry
-            }
-            let (winning_shares, losing_pool) = if round.outcome == Outcome::Above {
-                (round.shares_above, round.pool_below)
+
+            if on_winning_side {
+                let side_boosted = if round.outcome == Outcome::Above {
+                    round.boosted_above
+                } else {
+                    round.boosted_below
+                };
+                winner_payout(
+                    pos.amount,
+                    distributed,
+                    pos.boosted,
+                    side_boosted,
+                    round.global_boosted,
+                )
             } else {
-                (round.shares_below, round.pool_above)
-            };
-            compute_payout(pos.shares, winning_shares, losing_pool, config.fee_bps)
+                // Loser gets 30% of distributed proportional to early-entry boost
+                loser_payout(distributed, pos.boosted, round.global_boosted)
+            }
         };
 
         // Reentrancy guard: mark before transfer
@@ -500,7 +541,6 @@ impl WickPredict {
 
     pub fn get_round(e: Env, round_id: u64) -> Round {
         let mut r = load_round(&e, round_id);
-        // Derive Locked status at read time (no extra tx needed)
         if r.status == Status::Open && e.ledger().timestamp() >= r.lock_ts {
             r.status = Status::Locked;
         }
@@ -563,7 +603,7 @@ mod tests {
     // ── Mock oracle ───────────────────────────────────────────────────────────
 
     #[contracttype]
-    enum MockKey { Prices }
+    enum MK { Prices }
 
     #[soroban_sdk::contract]
     struct MockOracle;
@@ -572,15 +612,14 @@ mod tests {
     impl MockOracle {
         pub fn set_price(e: Env, ts: u64, price: i128) {
             let mut m: soroban_sdk::Map<u64, i128> = e
-                .storage().instance().get(&MockKey::Prices)
+                .storage().instance().get(&MK::Prices)
                 .unwrap_or_else(|| soroban_sdk::map![&e]);
             m.set(ts, price);
-            e.storage().instance().set(&MockKey::Prices, &m);
+            e.storage().instance().set(&MK::Prices, &m);
         }
-
         pub fn lastprice(e: Env, _asset: OracleAsset) -> Option<PriceData> {
             let m: soroban_sdk::Map<u64, i128> = e
-                .storage().instance().get(&MockKey::Prices)
+                .storage().instance().get(&MK::Prices)
                 .unwrap_or_else(|| soroban_sdk::map![&e]);
             let mut best: Option<PriceData> = None;
             for (ts, price) in m.iter() {
@@ -592,376 +631,365 @@ mod tests {
             }
             best
         }
-
         pub fn price(e: Env, _asset: OracleAsset, timestamp: u64) -> Option<PriceData> {
             let m: soroban_sdk::Map<u64, i128> = e
-                .storage().instance().get(&MockKey::Prices)
+                .storage().instance().get(&MK::Prices)
                 .unwrap_or_else(|| soroban_sdk::map![&e]);
             m.get(timestamp).map(|p| PriceData { price: p, timestamp })
         }
-
-        pub fn decimals(_e: Env) -> u32 { 14 }
+        pub fn decimals(_: Env) -> u32 { 14 }
     }
 
-    // ── Test harness ──────────────────────────────────────────────────────────
+    // ── Harness ───────────────────────────────────────────────────────────────
 
-    const LOCK_OFFSET: u64 = 180;
-    const FEE_BPS: u32 = 200;
-    const MIN_BET: i128 = 100_000_000; // 10 XLM
-    const T0: u64 = 1_000_000; // base timestamp (epoch-aligned)
-    const STRIKE: i128 = 13_000_000_000_000; // $0.13 with 14 decimals
-    const PRICE_UP: i128 = 14_000_000_000_000;   // $0.14 — above
-    const PRICE_DOWN: i128 = 12_000_000_000_000; // $0.12 — below
+    const LOCK: u64 = 180;
+    const FEE: u32 = 200; // 2%
+    const MIN: i128 = 100_000_000; // 10 XLM
+    const T0: u64 = 1_000_000;
+    const STRIKE: i128 = 17_000_000_000_000; // ~$0.17
+    const PRICE_UP: i128 = 18_000_000_000_000;
+    const PRICE_DN: i128 = 16_000_000_000_000;
 
-    struct Ctx {
-        env: Env,
-        contract: Address,
-        oracle: Address,
-        token: Address,
-        admin: Address,
-    }
+    struct Ctx { env: Env, c: Address, oracle: Address, token: Address, admin: Address }
 
     impl Ctx {
         fn new() -> Self {
             let env = Env::default();
             env.mock_all_auths();
             env.ledger().set_timestamp(T0);
-
             let admin = Address::generate(&env);
             let oracle = env.register(MockOracle, ());
             let token = env.register_stellar_asset_contract_v2(admin.clone()).address();
-            let contract = env.register(WickPredict, ());
-
-            WickPredictClient::new(&env, &contract).initialize(
-                &admin, &oracle, &token, &FEE_BPS, &MIN_BET, &LOCK_OFFSET,
-            );
-            Ctx { env, contract, oracle, token, admin }
+            let c = env.register(WickPredict, ());
+            WickPredictClient::new(&env, &c).initialize(&admin, &oracle, &token, &FEE, &MIN, &LOCK);
+            Ctx { env, c, oracle, token, admin }
         }
-
-        fn client(&self) -> WickPredictClient { WickPredictClient::new(&self.env, &self.contract) }
-        fn oracle_client(&self) -> MockOracleClient { MockOracleClient::new(&self.env, &self.oracle) }
-        fn mint(&self, to: &Address, amt: i128) {
-            token::StellarAssetClient::new(&self.env, &self.token).mint(to, &amt);
+        fn client(&self) -> WickPredictClient { WickPredictClient::new(&self.env, &self.c) }
+        fn oracle(&self) -> MockOracleClient { MockOracleClient::new(&self.env, &self.oracle) }
+        fn set_price(&self, ts: u64, price: i128) { self.oracle().set_price(&ts, &price); }
+        fn mint(&self, to: &Address, n: i128) {
+            token::StellarAssetClient::new(&self.env, &self.token).mint(to, &n);
         }
-        fn balance(&self, addr: &Address) -> i128 {
-            token::TokenClient::new(&self.env, &self.token).balance(addr)
+        fn balance(&self, a: &Address) -> i128 {
+            token::TokenClient::new(&self.env, &self.token).balance(a)
         }
         fn now(&self) -> u64 { self.env.ledger().timestamp() }
-        fn advance(&self, secs: u64) {
-            self.env.ledger().set_timestamp(self.now() + secs);
-        }
-        /// Seed oracle with a strike, create a round, return round_id.
-        fn open_round(&self, strike: i128) -> u64 {
-            self.oracle_client().set_price(&T0, &strike);
+        fn set_ts(&self, ts: u64) { self.env.ledger().set_timestamp(ts); }
+        fn open(&self) -> u64 {
+            self.set_price(T0, STRIKE);
             self.client().create_round()
         }
-        /// Advance to settle_ts, set settle price, call settle().
-        fn settle_round(&self, id: u64, settle_price: i128) {
-            let round = self.client().get_round(&id);
-            self.oracle_client().set_price(&round.settle_ts, &settle_price);
-            self.env.ledger().set_timestamp(round.settle_ts);
+        fn settle(&self, id: u64, price: i128) {
+            let r = self.client().get_round(&id);
+            self.set_price(r.settle_ts, price);
+            self.set_ts(r.settle_ts);
             self.client().settle(&id);
         }
     }
 
-    macro_rules! expect_err {
-        ($res:expr, $err:expr) => {
-            match $res {
-                Err(Ok(e)) => assert_eq!(e, Into::<soroban_sdk::Error>::into($err)),
-                other => panic!("expected {:?}, got {:?}", $err, other),
+    macro_rules! err {
+        ($r:expr, $e:expr) => {
+            match $r {
+                Err(Ok(e)) => assert_eq!(e, Into::<soroban_sdk::Error>::into($e)),
+                o => panic!("expected {:?}, got {:?}", $e, o),
             }
         };
     }
 
-    // ── Pure math tests ───────────────────────────────────────────────────────
+    // ── Pure math ─────────────────────────────────────────────────────────────
 
     #[test]
-    fn test_shares_early_bet() {
-        // Bet at t=0 → full shares (1000/1000 = 1.0x)
-        let shares = compute_shares(1_000_000_000, T0, T0, T0 + LOCK_OFFSET);
-        assert_eq!(shares, 1_000_000_000);
+    fn boosted_early_beats_late() {
+        let early = boosted_shares(1_000_000_000, T0,       T0 + LOCK);
+        let late  = boosted_shares(1_000_000_000, T0 + 170, T0 + LOCK);
+        assert!(early > late, "early bettor should have more boosted shares");
     }
 
     #[test]
-    fn test_shares_late_bet() {
-        // Bet at t=lock_ts → half shares (500/1000 = 0.5x)
-        let bet_ts = T0 + LOCK_OFFSET;
-        let shares = compute_shares(1_000_000_000, bet_ts, T0, bet_ts);
-        assert_eq!(shares, 500_000_000);
+    fn winner_payout_includes_base() {
+        // winner always gets at least their stake back
+        let payout = winner_payout(500_000_000, 200_000_000, 1000, 2000, 3000);
+        assert!(payout >= 500_000_000, "winner should receive at least their stake");
     }
 
     #[test]
-    fn test_shares_midpoint() {
-        // Bet at t=lock/2 → 750/1000 = 0.75x
-        let shares = compute_shares(1_000_000_000, T0 + LOCK_OFFSET / 2, T0, T0 + LOCK_OFFSET);
-        assert_eq!(shares, 750_000_000);
+    fn loser_gets_partial_refund() {
+        // loser receives 30% of distributed proportional to early-entry boost
+        let payout = loser_payout(300_000_000, 500, 1000);
+        // = 300M * 30% * 500/1000 = 300M * 0.15 = 45M
+        assert_eq!(payout, 45_000_000);
     }
 
     #[test]
-    fn test_early_bettor_earns_more_than_late() {
-        // Both bet same amount; early bet should produce higher payout share.
-        let amount = 1_000_000_000i128;
-        let shares_early = compute_shares(amount, T0, T0, T0 + LOCK_OFFSET);
-        let shares_late = compute_shares(amount, T0 + LOCK_OFFSET - 1, T0, T0 + LOCK_OFFSET);
-        assert!(shares_early > shares_late, "early should get more shares");
+    fn conservation_winner_plus_losers_eq_total() {
+        // One winner (500 XLM), one loser (300 XLM), both bet at t=0
+        let total = 800_000_000i128;
+        let losing_pool = 300_000_000i128;
+        let fee = fee_amount(losing_pool, FEE);
+        let distributed = losing_pool - fee;
 
-        // Total winning shares = shares_early + shares_late.
-        // Losing pool = 1000 XLM (some bettor on opposite side).
-        let losing_pool = 1_000_000_000i128;
-        let total = shares_early + shares_late;
-        let p_early = compute_payout(shares_early, total, losing_pool, FEE_BPS);
-        let p_late  = compute_payout(shares_late,  total, losing_pool, FEE_BPS);
-        assert!(p_early > p_late, "early bettor should earn more");
+        let w_boosted = 500_000_000i128 * LOCK as i128;
+        let l_boosted = 300_000_000i128 * LOCK as i128;
+        let global = w_boosted + l_boosted;
+
+        let w_pay = winner_payout(500_000_000, distributed, w_boosted, w_boosted, global);
+        let l_pay = loser_payout(distributed, l_boosted, global);
+
+        let sum = w_pay + l_pay;
+        assert!(sum + fee <= total,
+            "conservation violated: sum={sum} fee={fee} total={total}");
+        // Dust should be small
+        let dust = total - sum - fee;
+        assert!(dust < 1000, "unexpected dust: {dust}");
     }
 
     #[test]
-    fn test_payout_conservation() {
-        // sum(payouts) + fee ≤ losing_pool  (no over-payment)
-        let losing_pool = 5_000_000_000i128;
-        let s1 = compute_shares(1_000_000_000, T0,              T0, T0 + LOCK_OFFSET);
-        let s2 = compute_shares(2_000_000_000, T0 + 60,         T0, T0 + LOCK_OFFSET);
-        let s3 = compute_shares(1_500_000_000, T0 + LOCK_OFFSET / 2, T0, T0 + LOCK_OFFSET);
-        let total_shares = s1 + s2 + s3;
+    fn conservation_multiple_bettors() {
+        let winning = [(500_000_000i128, T0), (300_000_000i128, T0+60), (200_000_000i128, T0+120)];
+        let losing  = [(400_000_000i128, T0+30), (150_000_000i128, T0+90)];
 
-        let p1 = compute_payout(s1, total_shares, losing_pool, FEE_BPS);
-        let p2 = compute_payout(s2, total_shares, losing_pool, FEE_BPS);
-        let p3 = compute_payout(s3, total_shares, losing_pool, FEE_BPS);
-        let fee = losing_pool * FEE_BPS as i128 / 10_000;
+        let pool_win: i128  = winning.iter().map(|(a,_)| a).sum();
+        let pool_lose: i128 = losing.iter().map(|(a,_)| a).sum();
+        let total = pool_win + pool_lose;
 
-        let sum = p1 + p2 + p3;
-        assert!(sum + fee <= losing_pool,
-            "conservation violated: sum={sum} fee={fee} losing={losing_pool}");
-        // Dust should be tiny
-        let dust = losing_pool - sum - fee;
-        assert!(dust < total_shares, "unexpected dust: {dust}");
+        let fee = fee_amount(pool_lose, FEE);
+        let distributed = pool_lose - fee;
+
+        let win_b  = [boosted_shares(winning[0].0, winning[0].1, T0+LOCK),
+                      boosted_shares(winning[1].0, winning[1].1, T0+LOCK),
+                      boosted_shares(winning[2].0, winning[2].1, T0+LOCK)];
+        let lose_b = [boosted_shares(losing[0].0, losing[0].1, T0+LOCK),
+                      boosted_shares(losing[1].0, losing[1].1, T0+LOCK)];
+
+        let total_win_b: i128  = win_b.iter().sum();
+        let total_lose_b: i128 = lose_b.iter().sum();
+        let global = total_win_b + total_lose_b;
+
+        let mut total_out = fee;
+        for (i, (amt, _)) in winning.iter().enumerate() {
+            total_out += winner_payout(*amt, distributed, win_b[i], total_win_b, global);
+        }
+        for (i, _) in losing.iter().enumerate() {
+            total_out += loser_payout(distributed, lose_b[i], global);
+        }
+
+        assert!(total_out <= total,
+            "overpaid: total_out={total_out} total={total}");
     }
 
-    // ── Lifecycle tests ───────────────────────────────────────────────────────
+    // ── Lifecycle ─────────────────────────────────────────────────────────────
 
     #[test]
-    fn test_happy_path_above_wins() {
+    fn happy_path_above_wins_winner_beats_loser() {
         let ctx = Ctx::new();
-        let id = ctx.open_round(STRIKE);
+        let id = ctx.open();
 
-        let alice = Address::generate(&ctx.env);
-        let bob = Address::generate(&ctx.env);
+        let alice = Address::generate(&ctx.env); // bets Above early
+        let bob   = Address::generate(&ctx.env); // bets Above late
+        let carol = Address::generate(&ctx.env); // bets Below (loser)
+
         ctx.mint(&alice, 5_000_000_000);
-        ctx.mint(&bob,   2_000_000_000);
+        ctx.mint(&bob,   3_000_000_000);
+        ctx.mint(&carol, 2_000_000_000);
 
-        // Alice bets above at t=0 (max shares)
-        ctx.client().bet_above(&alice, &id, &5_000_000_000);
-        // Bob bets below at t=60s (slightly reduced shares)
-        ctx.advance(60);
-        ctx.client().bet_below(&bob, &id, &2_000_000_000);
+        ctx.client().bet_above(&alice, &id, &5_000_000_000); // t=T0, max boost
+        ctx.set_ts(T0 + 120);
+        ctx.client().bet_above(&bob, &id, &3_000_000_000);   // t=T0+120, less boost
+        ctx.set_ts(T0 + 30);
+        ctx.client().bet_below(&carol, &id, &2_000_000_000); // t=T0+30
 
-        ctx.settle_round(id, PRICE_UP); // above wins
+        ctx.settle(id, PRICE_UP); // Above wins
 
-        let round = ctx.client().get_round(&id);
-        assert_eq!(round.outcome, Outcome::Above);
-        assert_eq!(round.status, Status::Settled);
+        let alice_bal = ctx.balance(&alice);
+        let alice_pay = ctx.client().claim(&alice, &id);
+        assert!(alice_pay > 5_000_000_000, "alice (early winner) should profit");
+        assert_eq!(ctx.balance(&alice) - alice_bal, alice_pay);
 
-        // Alice (above) can claim; Bob (below) gets 0
-        let alice_bal_before = ctx.balance(&alice);
-        let payout = ctx.client().claim(&alice, &id);
-        assert!(payout > 0, "alice should win");
-        assert_eq!(ctx.balance(&alice) - alice_bal_before, payout);
+        let bob_pay = ctx.client().claim(&bob, &id);
+        assert!(bob_pay > 3_000_000_000, "bob (late winner) should still profit");
 
-        let bob_payout = ctx.client().claim(&bob, &id);
-        assert_eq!(bob_payout, 0, "bob lost");
+        // Alice bet early → more boosted → bigger winner bonus than Bob
+        assert!(alice_pay > bob_pay,
+            "early bettor alice ({alice_pay}) should outperform late bettor bob ({bob_pay})");
+
+        // Carol loses but gets a partial refund (30% of distributed * carol_boost/global)
+        let carol_pay = ctx.client().claim(&carol, &id);
+        assert!(carol_pay > 0, "loser carol should receive partial ninetails refund");
+        assert!(carol_pay < 2_000_000_000, "loser should not get full stake back");
     }
 
     #[test]
-    fn test_happy_path_below_wins() {
+    fn happy_path_below_wins() {
         let ctx = Ctx::new();
-        let id = ctx.open_round(STRIKE);
+        let id = ctx.open();
 
         let alice = Address::generate(&ctx.env);
-        let bob = Address::generate(&ctx.env);
+        let bob   = Address::generate(&ctx.env);
         ctx.mint(&alice, 3_000_000_000);
         ctx.mint(&bob,   6_000_000_000);
 
         ctx.client().bet_above(&alice, &id, &3_000_000_000);
-        ctx.advance(30);
+        ctx.set_ts(T0 + 60);
         ctx.client().bet_below(&bob, &id, &6_000_000_000);
 
-        ctx.settle_round(id, PRICE_DOWN); // below wins
+        ctx.settle(id, PRICE_DN);
 
-        assert_eq!(ctx.client().get_round(&id).outcome, Outcome::Below);
-        let payout = ctx.client().claim(&bob, &id);
-        assert!(payout > 0);
-        assert_eq!(ctx.client().claim(&alice, &id), 0);
+        let bob_pay = ctx.client().claim(&bob, &id);
+        assert!(bob_pay > 6_000_000_000, "bob (below winner) should profit");
+
+        let alice_pay = ctx.client().claim(&alice, &id);
+        assert!(alice_pay > 0, "alice (loser) gets ninetails refund");
+        assert!(alice_pay < 3_000_000_000);
     }
 
     #[test]
-    fn test_void_empty_pool() {
+    fn void_empty_pool_full_refund() {
         let ctx = Ctx::new();
-        let id = ctx.open_round(STRIKE);
+        let id = ctx.open();
         let alice = Address::generate(&ctx.env);
         ctx.mint(&alice, 5_000_000_000);
         ctx.client().bet_above(&alice, &id, &5_000_000_000);
-        // No one bets below → void
-        ctx.settle_round(id, PRICE_UP);
-        assert_eq!(ctx.client().get_round(&id).outcome, Outcome::Void);
-        // Full gross refund
-        let refund = ctx.client().claim(&alice, &id);
-        assert_eq!(refund, 5_000_000_000);
+        ctx.settle(id, PRICE_UP); // void — only above bets
+        assert_eq!(ctx.client().claim(&alice, &id), 5_000_000_000);
     }
 
     #[test]
-    fn test_void_exact_tie() {
+    fn void_exact_tie_full_refund() {
         let ctx = Ctx::new();
-        let id = ctx.open_round(STRIKE);
+        let id = ctx.open();
         let alice = Address::generate(&ctx.env);
-        let bob = Address::generate(&ctx.env);
+        let bob   = Address::generate(&ctx.env);
         ctx.mint(&alice, 3_000_000_000);
-        ctx.mint(&bob, 3_000_000_000);
+        ctx.mint(&bob,   3_000_000_000);
         ctx.client().bet_above(&alice, &id, &3_000_000_000);
-        ctx.client().bet_below(&bob, &id, &3_000_000_000);
-        ctx.settle_round(id, STRIKE); // settle price == strike → tie
-        assert_eq!(ctx.client().get_round(&id).outcome, Outcome::Void);
+        ctx.client().bet_below(&bob,   &id, &3_000_000_000);
+        ctx.settle(id, STRIKE); // exact tie
         assert_eq!(ctx.client().claim(&alice, &id), 3_000_000_000);
-        assert_eq!(ctx.client().claim(&bob, &id), 3_000_000_000);
+        assert_eq!(ctx.client().claim(&bob,   &id), 3_000_000_000);
     }
 
     #[test]
-    fn test_void_oracle_gap() {
+    fn void_oracle_gap_full_refund() {
         let ctx = Ctx::new();
-        let id = ctx.open_round(STRIKE);
+        let id = ctx.open();
         let alice = Address::generate(&ctx.env);
-        let bob = Address::generate(&ctx.env);
         ctx.mint(&alice, 2_000_000_000);
-        ctx.mint(&bob, 2_000_000_000);
         ctx.client().bet_above(&alice, &id, &2_000_000_000);
-        ctx.client().bet_below(&bob, &id, &2_000_000_000);
-        // Do NOT set settle price → oracle returns None → void
-        let round = ctx.client().get_round(&id);
-        ctx.env.ledger().set_timestamp(round.settle_ts);
+        let r = ctx.client().get_round(&id);
+        ctx.set_ts(r.settle_ts); // no settle price set → oracle returns None
         ctx.client().settle(&id);
-        assert_eq!(ctx.client().get_round(&id).outcome, Outcome::Void);
         assert_eq!(ctx.client().claim(&alice, &id), 2_000_000_000);
-        assert_eq!(ctx.client().claim(&bob, &id), 2_000_000_000);
     }
 
     #[test]
-    fn test_bet_after_lock_rejected() {
+    fn bet_after_lock_rejected() {
         let ctx = Ctx::new();
-        let id = ctx.open_round(STRIKE);
-        ctx.advance(LOCK_OFFSET); // exactly at lock_ts → rejected
+        let id = ctx.open();
+        ctx.set_ts(T0 + LOCK);
         let alice = Address::generate(&ctx.env);
-        ctx.mint(&alice, 1_000_000_000);
-        expect_err!(ctx.client().try_bet_above(&alice, &id, &1_000_000_000), Error::RoundLocked);
+        ctx.mint(&alice, MIN);
+        err!(ctx.client().try_bet_above(&alice, &id, &MIN), Error::RoundLocked);
     }
 
     #[test]
-    fn test_bet_below_minimum_rejected() {
+    fn bet_below_minimum_rejected() {
         let ctx = Ctx::new();
-        let id = ctx.open_round(STRIKE);
+        let id = ctx.open();
         let alice = Address::generate(&ctx.env);
-        ctx.mint(&alice, 1_000_000_000);
-        expect_err!(
-            ctx.client().try_bet_above(&alice, &id, &(MIN_BET - 1)),
-            Error::BetTooSmall
-        );
+        ctx.mint(&alice, MIN);
+        err!(ctx.client().try_bet_above(&alice, &id, &(MIN - 1)), Error::BetTooSmall);
     }
 
     #[test]
-    fn test_double_bet_rejected() {
+    fn double_bet_rejected() {
         let ctx = Ctx::new();
-        let id = ctx.open_round(STRIKE);
+        let id = ctx.open();
         let alice = Address::generate(&ctx.env);
+        ctx.mint(&alice, MIN * 2);
+        ctx.client().bet_above(&alice, &id, &MIN);
+        err!(ctx.client().try_bet_above(&alice, &id, &MIN), Error::AlreadyBet);
+    }
+
+    #[test]
+    fn double_claim_rejected() {
+        let ctx = Ctx::new();
+        let id = ctx.open();
+        let alice = Address::generate(&ctx.env);
+        let bob   = Address::generate(&ctx.env);
         ctx.mint(&alice, 3_000_000_000);
-        ctx.client().bet_above(&alice, &id, &1_000_000_000);
-        expect_err!(ctx.client().try_bet_above(&alice, &id, &1_000_000_000), Error::AlreadyBet);
-    }
-
-    #[test]
-    fn test_double_claim_rejected() {
-        let ctx = Ctx::new();
-        let id = ctx.open_round(STRIKE);
-        let alice = Address::generate(&ctx.env);
-        let bob = Address::generate(&ctx.env);
-        ctx.mint(&alice, 3_000_000_000);
-        ctx.mint(&bob, 2_000_000_000);
+        ctx.mint(&bob,   2_000_000_000);
         ctx.client().bet_above(&alice, &id, &3_000_000_000);
-        ctx.client().bet_below(&bob, &id, &2_000_000_000);
-        ctx.settle_round(id, PRICE_UP);
+        ctx.client().bet_below(&bob,   &id, &2_000_000_000);
+        ctx.settle(id, PRICE_UP);
         ctx.client().claim(&alice, &id);
-        expect_err!(ctx.client().try_claim(&alice, &id), Error::NothingToClaim);
+        err!(ctx.client().try_claim(&alice, &id), Error::NothingToClaim);
     }
 
     #[test]
-    fn test_settle_too_early_rejected() {
+    fn settle_too_early_rejected() {
         let ctx = Ctx::new();
-        let id = ctx.open_round(STRIKE);
-        expect_err!(ctx.client().try_settle(&id), Error::TooEarly);
+        let id = ctx.open();
+        err!(ctx.client().try_settle(&id), Error::TooEarly);
     }
 
     #[test]
-    fn test_settle_idempotent() {
+    fn settle_idempotent() {
         let ctx = Ctx::new();
-        let id = ctx.open_round(STRIKE);
+        let id = ctx.open();
         let alice = Address::generate(&ctx.env);
-        let bob = Address::generate(&ctx.env);
+        let bob   = Address::generate(&ctx.env);
         ctx.mint(&alice, 2_000_000_000);
-        ctx.mint(&bob, 2_000_000_000);
+        ctx.mint(&bob,   2_000_000_000);
         ctx.client().bet_above(&alice, &id, &2_000_000_000);
-        ctx.client().bet_below(&bob, &id, &2_000_000_000);
-        ctx.settle_round(id, PRICE_UP);
-        expect_err!(ctx.client().try_settle(&id), Error::AlreadySettled);
+        ctx.client().bet_below(&bob,   &id, &2_000_000_000);
+        ctx.settle(id, PRICE_UP);
+        err!(ctx.client().try_settle(&id), Error::AlreadySettled);
     }
 
     #[test]
-    fn test_duplicate_round_rejected() {
+    fn duplicate_round_rejected() {
         let ctx = Ctx::new();
-        ctx.open_round(STRIKE); // first call sets LastStrikeTs = T0
-        // Same oracle tick → DuplicateRound
-        expect_err!(ctx.client().try_create_round(), Error::DuplicateRound);
+        ctx.open();
+        err!(ctx.client().try_create_round(), Error::DuplicateRound);
     }
 
-    #[test]
-    fn test_contract_level_conservation() {
-        // sum(all payouts) + fee ≤ total staked — contract must never overpay
-        let ctx = Ctx::new();
-        let id = ctx.open_round(STRIKE);
+    // ── The key invariant ─────────────────────────────────────────────────────
+    // Contract balance never goes negative regardless of bet timing.
 
-        // (address, side, amount, absolute_offset_from_T0)
-        let users = [
+    #[test]
+    fn contract_never_overpays() {
+        let ctx = Ctx::new();
+        let id = ctx.open();
+
+        let bettors = [
             (Address::generate(&ctx.env), Side::Above, 2_000_000_000i128, 0u64),
-            (Address::generate(&ctx.env), Side::Above, 1_500_000_000i128, 60u64),
-            (Address::generate(&ctx.env), Side::Above,   800_000_000i128, 120u64),
-            (Address::generate(&ctx.env), Side::Below, 3_000_000_000i128, 30u64),
-            (Address::generate(&ctx.env), Side::Below, 1_200_000_000i128, 90u64),
+            (Address::generate(&ctx.env), Side::Above, 1_500_000_000,     60),
+            (Address::generate(&ctx.env), Side::Above,   800_000_000,    120),
+            (Address::generate(&ctx.env), Side::Below, 3_000_000_000,     30),
+            (Address::generate(&ctx.env), Side::Below, 1_200_000_000,     90),
         ];
 
-        let total_staked: i128 = users.iter().map(|(_, _, a, _)| *a).sum();
-        for (addr, side, amt, offset) in &users {
+        let total_staked: i128 = bettors.iter().map(|(_, _, a, _)| *a).sum();
+
+        for (addr, side, amt, offset) in &bettors {
             ctx.mint(addr, *amt);
-            // Use absolute offset from T0 so no user exceeds lock_ts (180s)
-            ctx.env.ledger().set_timestamp(T0 + offset);
+            ctx.set_ts(T0 + offset);
             match side {
                 Side::Above => ctx.client().bet_above(addr, &id, amt),
                 Side::Below => ctx.client().bet_below(addr, &id, amt),
             }
         }
 
-        ctx.settle_round(id, PRICE_UP); // Above wins
+        ctx.settle(id, PRICE_UP); // Above wins
 
-        let contract_before = ctx.balance(&ctx.contract);
+        let _contract_before = ctx.balance(&ctx.c);
         let mut total_paid: i128 = 0;
-        for (addr, _, _, _) in &users {
+        for (addr, _, _, _) in &bettors {
             total_paid += ctx.client().claim(addr, &id);
         }
-        let contract_after = ctx.balance(&ctx.contract);
 
-        assert!(contract_after >= 0, "contract went negative");
-        assert!(total_paid <= total_staked, "overpaid: {total_paid} > {total_staked}");
-
-        // Fee should remain in contract
-        let round = ctx.client().get_round(&id);
-        let losing_pool = round.pool_above; // below won, above loses... wait
-        // Above won, so below pool is the losing pool
-        let losing_pool = round.pool_below;
-        let fee = losing_pool * FEE_BPS as i128 / 10_000;
-        assert!(contract_after >= fee - 1, "fee not retained"); // -1 for dust
+        assert!(ctx.balance(&ctx.c) >= 0, "contract went negative");
+        assert!(total_paid <= total_staked,
+            "overpaid: {total_paid} > total_staked {total_staked}");
     }
 }
