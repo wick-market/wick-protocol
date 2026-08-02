@@ -20,7 +20,7 @@ import {
 
 const PREDICT_CONTRACT = process.env.PREDICT_CONTRACT
   ?? "CBJDHRRZ7G62S5ZGDEM53CIHRS3OMKCGOHM27I5XYBD2ANNVNIAJHTX2";
-const ORACLE_CONTRACT = "CABYY3QQCL5TERRFUSW7SO2NOOHQ2YXCMMOD22WDNVIADUKLSNPMPJZ2";
+const ORACLE_CONTRACT = "CDSO4XUHS27LTG2ND3PCAU2NE6EPZWFTBJMZYZBVQUEDKFLPTGTP5UY3"; // no-auth version
 const RPC_URL = "https://soroban-testnet.stellar.org";
 const NETWORK = Networks.TESTNET;
 const ROUND_SECS = 60;     // oracle_interval — must match initialize()
@@ -30,11 +30,11 @@ const LOCK_SECS  = 45;     // lock_offset — must match initialize()
 const ADMIN_SECRET = process.env.ADMIN_SECRET
   ?? "SDGZDDLJCCE6BQGROTACAZGLI3OIFNM3DTJJL7RZRM5KNQSDLXQUS73E";
 
-// Test wallets that auto-bet both sides
+// Test wallets that auto-bet both sides (funded testnet accounts)
 const BETTORS = [
-  { secret: "", name: "wallet-1", side: "above" as const, amountStroops: 2000000000n }, // 200 XLM Above
-  { secret: "", name: "wallet-2", side: "below" as const, amountStroops: 1500000000n }, // 150 XLM Below
-  { secret: "", name: "wallet-3", side: "below" as const, amountStroops: 1000000000n }, // 100 XLM Below
+  { secret: "SBB4U4OKPILVJBWNIBBFOSHMBKHBMN6HHDX6DEZV5HWANM2FRYSIRRT2", name: "wallet-1", side: "above" as const, amountStroops: 2000000000n }, // 200 XLM Above
+  { secret: "SCALTGO6MAGGWL43HACE5L6STUQZ7T3TYO6MBQ7HAAVBK6FRTRY7TPH3", name: "wallet-2", side: "below" as const, amountStroops: 1500000000n }, // 150 XLM Below
+  { secret: "SB4RSZRZ6GQLA5IQNPFO7OXSOTOSWLJV7LRCQM3UMU2DXWAUL2X5VHOZ", name: "wallet-3", side: "below" as const, amountStroops: 1000000000n }, // 100 XLM Below
 ];
 
 const server = new rpc.Server(RPC_URL, { allowHttp: false });
@@ -107,7 +107,10 @@ async function tick() {
   const newPrice = walkPrice();
   try {
     await invoke(adminKeypair, oracleContract, "update_price", [
-      nativeToScVal(newPrice, { type: "i128" }),
+      xdr.ScVal.scvI128(new xdr.Int128Parts({
+        hi: xdr.Int64.fromString((newPrice >> 64n).toString()),
+        lo: xdr.Uint64.fromString((newPrice & 0xFFFFFFFFFFFFFFFFn).toString()),
+      })),
     ]);
     log("oracle updated", { price: (Number(newPrice) / 1e14).toFixed(4) });
   } catch (e) { log("oracle update failed", { err: String(e) }); }
@@ -188,7 +191,7 @@ async function openNewRound() {
 
 async function autoBet(roundId: bigint) {
   for (const bettor of BETTORS) {
-    if (!bettor.secret) continue; // secrets loaded below
+    if (!bettor.secret) continue;
     const keypair = Keypair.fromSecret(bettor.secret);
     const key = `${roundId}-${keypair.publicKey()}`;
     if (betTracker.has(key)) continue;
@@ -197,12 +200,15 @@ async function autoBet(roundId: bigint) {
       await invoke(keypair, predictContract, method, [
         nativeToScVal(keypair.publicKey(), { type: "address" }),
         nativeToScVal(roundId, { type: "u64" }),
-        nativeToScVal(bettor.amount, { type: "i128" }),
+        xdr.ScVal.scvI128(new xdr.Int128Parts({
+          hi: xdr.Int64.fromString((bettor.amountStroops >> 64n).toString()),
+          lo: xdr.Uint64.fromString((bettor.amountStroops & 0xFFFFFFFFFFFFFFFFn).toString()),
+        })),
       ]);
       betTracker.add(key);
       log("auto-bet", {
         wallet: bettor.name, side: bettor.side,
-        amount: `${Number(bettor.amount) / 1e7} XLM`,
+        amount: `${Number(bettor.amountStroops) / 1e7} XLM`,
       });
     } catch (e) {
       const msg = String(e);
@@ -214,15 +220,6 @@ async function autoBet(roundId: bigint) {
 }
 
 async function main() {
-  // Load test wallet secrets
-  for (let i = 0; i < BETTORS.length; i++) {
-    try {
-      const { execSync } = await import("child_process");
-      const secret = execSync(`stellar keys secret test-wallet-${i + 1} 2>/dev/null`, { encoding: "utf8" }).trim();
-      BETTORS[i]!.secret = secret;
-    } catch { log(`test-wallet-${i+1} secret not found — skipping auto-bet`); }
-  }
-
   // Read current state
   const id = await query("current_round_id", predictContract);
   if (id) currentRoundId = BigInt(id as string | number | bigint);

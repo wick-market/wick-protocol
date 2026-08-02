@@ -44,10 +44,8 @@ impl TestOracle {
         e.storage().instance().set(&Key::Timestamp, &e.ledger().timestamp());
     }
 
-    /// Set a new price. Timestamp advances to current ledger time.
+    /// Set a new price. No auth — test oracle, anyone can update.
     pub fn update_price(e: Env, price: i128) {
-        let admin: Address = e.storage().instance().get(&Key::Admin).unwrap();
-        admin.require_auth();
         e.storage().instance().set(&Key::Price, &price);
         e.storage().instance().set(&Key::Timestamp, &e.ledger().timestamp());
     }
