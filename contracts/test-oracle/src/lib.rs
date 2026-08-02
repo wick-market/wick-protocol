@@ -58,15 +58,12 @@ impl TestOracle {
         Some(PriceData { price, timestamp })
     }
 
-    pub fn price(e: Env, _asset: OracleAsset, timestamp: u64) -> Option<PriceData> {
-        let stored_ts: u64 = e.storage().instance().get(&Key::Timestamp).unwrap_or(0);
-        // Return stored price if it matches or is earlier than requested timestamp.
-        if stored_ts <= timestamp {
-            let price: i128 = e.storage().instance().get(&Key::Price)?;
-            Some(PriceData { price, timestamp: stored_ts })
-        } else {
-            None
-        }
+    pub fn price(e: Env, _asset: OracleAsset, _timestamp: u64) -> Option<PriceData> {
+        // Test oracle: always return the current stored price.
+        // Historical accuracy doesn't matter for testing — we just need a price.
+        let price: i128 = e.storage().instance().get(&Key::Price)?;
+        let ts: u64 = e.storage().instance().get(&Key::Timestamp).unwrap_or(0);
+        Some(PriceData { price, timestamp: ts })
     }
 
     pub fn decimals(_e: Env) -> u32 {

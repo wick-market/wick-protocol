@@ -18,23 +18,23 @@ import {
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
-const PREDICT_CONTRACT = process.env.PREDICT_CONTRACT
-  ?? "CBJDHRRZ7G62S5ZGDEM53CIHRS3OMKCGOHM27I5XYBD2ANNVNIAJHTX2";
-const ORACLE_CONTRACT = "CDSO4XUHS27LTG2ND3PCAU2NE6EPZWFTBJMZYZBVQUEDKFLPTGTP5UY3"; // no-auth version
+const PREDICT_CONTRACT = (process.env.PREDICT_CONTRACT
+  ?? "CAEBJPGQZHNHQIAOXBIWRWRVYJZ3L4DHDVSOVOTHDWN7CQY5FEFIURBJ").trim();
+const ORACLE_CONTRACT = "CAFG5FZFLG2EFEMQ3QKCBLLOLXMK3SNV5TCCDXTXOW3CGD6PXETW7HT2".trim();
 const RPC_URL = "https://soroban-testnet.stellar.org";
 const NETWORK = Networks.TESTNET;
 const ROUND_SECS = 60;     // oracle_interval — must match initialize()
 const LOCK_SECS  = 45;     // lock_offset — must match initialize()
 
 // Admin for oracle updates + creating rounds
-const ADMIN_SECRET = process.env.ADMIN_SECRET
-  ?? "SDGZDDLJCCE6BQGROTACAZGLI3OIFNM3DTJJL7RZRM5KNQSDLXQUS73E";
+const ADMIN_SECRET = (process.env.ADMIN_SECRET
+  ?? "SDGZDDLJCCE6BQGROTACAZGLI3OIFNM3DTJJL7RZRM5KNQSDLXQUS73E").trim();
 
 // Test wallets that auto-bet both sides (funded testnet accounts)
 const BETTORS = [
-  { secret: "SBB4U4OKPILVJBWNIBBFOSHMBKHBMN6HHDX6DEZV5HWANM2FRYSIRRT2", name: "wallet-1", side: "above" as const, amountStroops: 2000000000n }, // 200 XLM Above
-  { secret: "SCALTGO6MAGGWL43HACE5L6STUQZ7T3TYO6MBQ7HAAVBK6FRTRY7TPH3", name: "wallet-2", side: "below" as const, amountStroops: 1500000000n }, // 150 XLM Below
-  { secret: "SB4RSZRZ6GQLA5IQNPFO7OXSOTOSWLJV7LRCQM3UMU2DXWAUL2X5VHOZ", name: "wallet-3", side: "below" as const, amountStroops: 1000000000n }, // 100 XLM Below
+  { secret: "SBB4U4OKPILVJBWNIBBFOSHMBKHBMN6HHDX6DEZV5HWANM2FRYSIRRT2".trim(), name: "wallet-1", side: "above" as const, amountStroops: 2000000000n }, // 200 XLM Above
+  { secret: "SCALTGO6MAGGWL43HACE5L6STUQZ7T3TYO6MBQ7HAAVBK6FRTRY7TPH3".trim(), name: "wallet-2", side: "below" as const, amountStroops: 1500000000n }, // 150 XLM Below
+  { secret: "SB4RSZRZ6GQLA5IQNPFO7OXSOTOSWLJV7LRCQM3UMU2DXWAUL2X5VHOZ".trim(), name: "wallet-3", side: "below" as const, amountStroops: 1000000000n }, // 100 XLM Below
 ];
 
 const server = new rpc.Server(RPC_URL, { allowHttp: false });
@@ -61,8 +61,8 @@ async function invoke(keypair: Keypair, contract: Contract, method: string, args
   assembled.sign(keypair);
   const send = await server.sendTransaction(assembled);
   if (send.status === "ERROR") throw new Error(`send ${method} failed`);
-  for (let i = 0; i < 20; i++) {
-    await new Promise(r => setTimeout(r, 2000));
+  for (let i = 0; i < 35; i++) {
+    await new Promise(r => setTimeout(r, 1000));
     const res = await server.getTransaction(send.hash);
     if (res.status === rpc.Api.GetTransactionStatus.SUCCESS) {
       const rv = (res as rpc.Api.GetSuccessfulTransactionResponse).returnValue;
