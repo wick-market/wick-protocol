@@ -36,11 +36,16 @@ interface MarketConfig {
   currentRoundId: bigint;
 }
 
+/**
+ * Seed prices are in oracle units: USD × 1e14 (14 decimals, matching Reflector).
+ * So $65,000 is 65_000 * 1e14 = 6.5e18, not 6.5e17 — the earlier values were a
+ * factor of ten low and the UI showed BTC at $6,500.
+ */
 const MARKETS: MarketConfig[] = [
-  { symbol: "XLM", contractId: "CCHKYSNNU27QYKBAWTPHCIHOZQISYQ3GUEC3KVCZ6QPPNWN4QQXTTM3K", price: 17500000000000n, decimals: 4, currentRoundId: 0n },
-  { symbol: "BTC", contractId: "CBIDB2UVODQFULE5GDOFCITHADLRWCPOCCN3FUPGKUDEHGZ7P3KRXIA4", price: 650000000000000000n, decimals: 2, currentRoundId: 0n },
-  { symbol: "ETH", contractId: "CAIETRXOO3YYJE7YISGPODJ6HTF2SZY2PC3WPD54ZW2EAWWAMZZWL7IS", price: 34000000000000000n, decimals: 2, currentRoundId: 0n },
-  { symbol: "SOL", contractId: "CDAL2IADNQYUWDLZHN72EERCTT2SSPDC6RBXFHR3ZZHDTVGQHD4LG3T3", price: 1800000000000000n, decimals: 2, currentRoundId: 0n },
+  { symbol: "XLM", contractId: "CCHKYSNNU27QYKBAWTPHCIHOZQISYQ3GUEC3KVCZ6QPPNWN4QQXTTM3K", price: 17500000000000n, decimals: 4, currentRoundId: 0n },      // $0.175
+  { symbol: "BTC", contractId: "CBIDB2UVODQFULE5GDOFCITHADLRWCPOCCN3FUPGKUDEHGZ7P3KRXIA4", price: 6500000000000000000n, decimals: 2, currentRoundId: 0n }, // $65,000
+  { symbol: "ETH", contractId: "CAIETRXOO3YYJE7YISGPODJ6HTF2SZY2PC3WPD54ZW2EAWWAMZZWL7IS", price: 340000000000000000n, decimals: 2, currentRoundId: 0n },  // $3,400
+  { symbol: "SOL", contractId: "CDAL2IADNQYUWDLZHN72EERCTT2SSPDC6RBXFHR3ZZHDTVGQHD4LG3T3", price: 18000000000000000n, decimals: 2, currentRoundId: 0n },   // $180
 ];
 
 /**
@@ -72,7 +77,29 @@ function i128(v: bigint): xdr.ScVal {
   }));
 }
 
+/**
+ * One in-flight tx per signing account.
+ *
+ * Every tx is built from a freshly fetched sequence number, so two market loops
+ * signing with the same key at the same moment build two txs claiming the same
+ * seq — one lands and the other dies with a send failure or a timeout. Four
+ * markets all push oracle prices as admin, so that collision was constant.
+ * Serializing per key costs a little latency and removes the whole class.
+ */
+const txLocks = new Map<string, Promise<unknown>>();
+
+function withAccountLock<T>(pubkey: string, fn: () => Promise<T>): Promise<T> {
+  const prev = txLocks.get(pubkey) ?? Promise.resolve();
+  const next = prev.then(fn, fn); // run regardless of how the previous tx ended
+  txLocks.set(pubkey, next.catch(() => {}));
+  return next;
+}
+
 async function invoke(keypair: Keypair, contract: Contract, method: string, args: xdr.ScVal[] = []): Promise<unknown> {
+  return withAccountLock(keypair.publicKey(), () => invokeUnlocked(keypair, contract, method, args));
+}
+
+async function invokeUnlocked(keypair: Keypair, contract: Contract, method: string, args: xdr.ScVal[] = []): Promise<unknown> {
   const account = await server.getAccount(keypair.publicKey());
   const tx = new TransactionBuilder(account, { fee: BASE_FEE, networkPassphrase: NETWORK })
     .addOperation(contract.call(method, ...args))
@@ -121,11 +148,16 @@ function walkPrice(m: MarketConfig): bigint {
  */
 async function pushPrice(m: MarketConfig): Promise<void> {
   const newPrice = walkPrice(m);
+  // Two cycles landing on the same number would give the next round the same
+  // strike as the last — read-back tie, instant Void. Nudge so strikes differ.
+  if (newPrice === m.price) {
+    m.price = (m.price * 1000000001n) / 1000000000n;
+  }
   await invoke(adminKeypair, oracleContract, "update_asset_price", [
     xdr.ScVal.scvSymbol(m.symbol),
-    i128(newPrice),
+    i128(m.price),
   ]);
-  log("oracle updated", { market: m.symbol, price: (Number(newPrice) / 1e14).toFixed(m.decimals) });
+  log("oracle updated", { market: m.symbol, price: (Number(m.price) / 1e14).toFixed(m.decimals) });
 }
 
 // ── Betting ───────────────────────────────────────────────────────────────────
@@ -183,10 +215,10 @@ async function autoClaim(m: MarketConfig, roundId: bigint): Promise<void> {
         payoutXlm: payout != null ? Number(payout) / 1e7 : "unknown",
       });
     } catch (e) {
-      // NothingToClaim (#9) is normal — the bot never bet this round, or the
-      // round voided with a zero position. Don't retry those.
+      // NothingToClaim (#10) is normal — the bot never bet this round, or the
+      // position was already claimed. Don't retry those; #9 is AlreadyBet.
       const msg = String(e);
-      if (!msg.includes("#9") && !msg.includes("NothingToClaim")) {
+      if (!msg.includes("#10") && !msg.includes("NothingToClaim")) {
         claimTracker.delete(key);
         log("claim failed", { market: m.symbol, round: roundId.toString(), wallet: bettor.name, err: msg });
       }
@@ -275,6 +307,12 @@ async function processMarket(m: MarketConfig): Promise<void> {
 
   // Settle once the window has passed.
   if (status !== "Settled" && now >= settleTs) {
+    // Move the price first. The test oracle's price(asset, ts) ignores ts and
+    // returns whatever is stored right now, so without a push between create
+    // and settle the contract reads back the exact strike — a tie, which is
+    // Void. Every round voided this way regardless of how the bots bet.
+    await pushPrice(m);
+
     try {
       await invoke(adminKeypair, predictContract, "settle", [
         nativeToScVal(m.currentRoundId, { type: "u64" }),
