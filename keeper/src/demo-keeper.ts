@@ -1,52 +1,76 @@
 /**
- * Demo keeper — runs 1-minute rounds using the test oracle.
+ * Demo keeper — drives fast rounds on all four markets using the test oracle.
  *
- * Every 60 seconds:
- *   1. Update oracle price (small random walk from last price)
- *   2. If current round past settle_ts → settle it
- *   3. If round settled or none → create new round
- *   4. Auto-bet from test wallets on both sides (so rounds never void)
+ * Each market runs its own independent loop, so a slow tx on BTC never stalls XLM.
+ * Per market, one cycle is:
+ *   1. push a fresh oracle price for the asset (this becomes the next strike_ts)
+ *   2. settle the current round once it is past settle_ts
+ *   3. claim every settled round for the bot wallets (recycles stake back)
+ *   4. create the next round and immediately auto-bet both sides in parallel
  *
- * Uses the test oracle contract (CABYY3...) so we control price timing.
- * Switch to Reflector oracle for production.
+ * Step 3 is what keeps this running: without claiming, the bot wallets drain
+ * within an hour and every round voids for want of an opposing side.
  */
 import "dotenv/config";
 import {
   Contract, Keypair, Networks, rpc,
-  TransactionBuilder, BASE_FEE, nativeToScVal, scValToNative, xdr,
+  TransactionBuilder, BASE_FEE, nativeToScVal, scValToNative, xdr, Address
 } from "@stellar/stellar-sdk";
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
-const PREDICT_CONTRACT = (process.env.PREDICT_CONTRACT
-  ?? "CAEBJPGQZHNHQIAOXBIWRWRVYJZ3L4DHDVSOVOTHDWN7CQY5FEFIURBJ").trim();
-const ORACLE_CONTRACT = "CAFG5FZFLG2EFEMQ3QKCBLLOLXMK3SNV5TCCDXTXOW3CGD6PXETW7HT2".trim();
 const RPC_URL = "https://soroban-testnet.stellar.org";
 const NETWORK = Networks.TESTNET;
-const ROUND_SECS = 60;     // oracle_interval — must match initialize()
-const LOCK_SECS  = 45;     // lock_offset — must match initialize()
-
-// Admin for oracle updates + creating rounds
 const ADMIN_SECRET = (process.env.ADMIN_SECRET
   ?? "SDGZDDLJCCE6BQGROTACAZGLI3OIFNM3DTJJL7RZRM5KNQSDLXQUS73E").trim();
+const ORACLE_CONTRACT = "CBCZDSMRMOYXRLV3IJNC6LC7HKV2UFE5KQ63P5LAKM73LAH4H4CNT4TM";
 
-// Test wallets that auto-bet both sides (funded testnet accounts)
+/** How often each market loop wakes up. Rounds are 60s, so this is just slack. */
+const POLL_MS = 5_000;
+
+interface MarketConfig {
+  symbol: string;
+  contractId: string;
+  price: bigint;
+  decimals: number;
+  currentRoundId: bigint;
+}
+
+const MARKETS: MarketConfig[] = [
+  { symbol: "XLM", contractId: "CCHKYSNNU27QYKBAWTPHCIHOZQISYQ3GUEC3KVCZ6QPPNWN4QQXTTM3K", price: 17500000000000n, decimals: 4, currentRoundId: 0n },
+  { symbol: "BTC", contractId: "CBIDB2UVODQFULE5GDOFCITHADLRWCPOCCN3FUPGKUDEHGZ7P3KRXIA4", price: 650000000000000000n, decimals: 2, currentRoundId: 0n },
+  { symbol: "ETH", contractId: "CAIETRXOO3YYJE7YISGPODJ6HTF2SZY2PC3WPD54ZW2EAWWAMZZWL7IS", price: 34000000000000000n, decimals: 2, currentRoundId: 0n },
+  { symbol: "SOL", contractId: "CDAL2IADNQYUWDLZHN72EERCTT2SSPDC6RBXFHR3ZZHDTVGQHD4LG3T3", price: 1800000000000000n, decimals: 2, currentRoundId: 0n },
+];
+
+/**
+ * Bot bettors. Amounts are deliberately small (20-30 XLM) — four markets at one
+ * round a minute is ~2k XLM/hour per wallet even with claiming, and friendbot
+ * only tops up to 10k.
+ */
 const BETTORS = [
-  { secret: "SBB4U4OKPILVJBWNIBBFOSHMBKHBMN6HHDX6DEZV5HWANM2FRYSIRRT2".trim(), name: "wallet-1", side: "above" as const, amountStroops: 2000000000n }, // 200 XLM Above
-  { secret: "SCALTGO6MAGGWL43HACE5L6STUQZ7T3TYO6MBQ7HAAVBK6FRTRY7TPH3".trim(), name: "wallet-2", side: "below" as const, amountStroops: 1500000000n }, // 150 XLM Below
-  { secret: "SB4RSZRZ6GQLA5IQNPFO7OXSOTOSWLJV7LRCQM3UMU2DXWAUL2X5VHOZ".trim(), name: "wallet-3", side: "below" as const, amountStroops: 1000000000n }, // 100 XLM Below
+  { secret: "SBB4U4OKPILVJBWNIBBFOSHMBKHBMN6HHDX6DEZV5HWANM2FRYSIRRT2".trim(), name: "wallet-1", side: "above" as const, amountStroops: 300000000n }, // 30 XLM Above
+  { secret: "SCALTGO6MAGGWL43HACE5L6STUQZ7T3TYO6MBQ7HAAVBK6FRTRY7TPH3".trim(), name: "wallet-2", side: "below" as const, amountStroops: 200000000n }, // 20 XLM Below
+  { secret: "SB4RSZRZ6GQLA5IQNPFO7OXSOTOSWLJV7LRCQM3UMU2DXWAUL2X5VHOZ".trim(), name: "wallet-3", side: "below" as const, amountStroops: 200000000n }, // 20 XLM Below
 ];
 
 const server = new rpc.Server(RPC_URL, { allowHttp: false });
 const adminKeypair = Keypair.fromSecret(ADMIN_SECRET);
-const predictContract = new Contract(PREDICT_CONTRACT);
-const oracleContract  = new Contract(ORACLE_CONTRACT);
+const oracleContract = new Contract(ORACLE_CONTRACT);
+const bettorKeypairs = BETTORS.map((b) => Keypair.fromSecret(b.secret));
 
 function log(msg: string, data?: Record<string, unknown>) {
   console.log(JSON.stringify({ ts: new Date().toISOString(), msg, ...data }));
 }
 
 // ── RPC helpers ───────────────────────────────────────────────────────────────
+
+function i128(v: bigint): xdr.ScVal {
+  return xdr.ScVal.scvI128(new xdr.Int128Parts({
+    hi: xdr.Int64.fromString((v >> 64n).toString()),
+    lo: xdr.Uint64.fromString((v & 0xFFFFFFFFFFFFFFFFn).toString()),
+  }));
+}
 
 async function invoke(keypair: Keypair, contract: Contract, method: string, args: xdr.ScVal[] = []): Promise<unknown> {
   const account = await server.getAccount(keypair.publicKey());
@@ -82,159 +106,224 @@ async function query(method: string, contract: Contract, args: xdr.ScVal[] = [])
   return scValToNative((sim as rpc.Api.SimulateTransactionSuccessResponse).result!.retval);
 }
 
-// ── Oracle price walk ─────────────────────────────────────────────────────────
+// ── Oracle ────────────────────────────────────────────────────────────────────
 
-let currentPrice = 17500000000000n; // ~$0.175 with 14 decimals
-
-function walkPrice(): bigint {
-  // ±0.3% random walk per tick
+/** Random walk, ±0.3% per tick. */
+function walkPrice(m: MarketConfig): bigint {
   const changePct = (Math.random() - 0.5) * 0.006;
-  currentPrice = BigInt(Math.round(Number(currentPrice) * (1 + changePct)));
-  return currentPrice;
+  m.price = BigInt(Math.round(Number(m.price) * (1 + changePct)));
+  return m.price;
 }
 
-// ── State ─────────────────────────────────────────────────────────────────────
-
-let currentRoundId = 0n;
-const betTracker = new Set<string>(); // "roundId-walletPubkey"
-
-// ── Main loop ─────────────────────────────────────────────────────────────────
-
-async function tick() {
-  const now = Math.floor(Date.now() / 1000);
-
-  // 1. Advance oracle price
-  const newPrice = walkPrice();
-  try {
-    await invoke(adminKeypair, oracleContract, "update_price", [
-      xdr.ScVal.scvI128(new xdr.Int128Parts({
-        hi: xdr.Int64.fromString((newPrice >> 64n).toString()),
-        lo: xdr.Uint64.fromString((newPrice & 0xFFFFFFFFFFFFFFFFn).toString()),
-      })),
-    ]);
-    log("oracle updated", { price: (Number(newPrice) / 1e14).toFixed(4) });
-  } catch (e) { log("oracle update failed", { err: String(e) }); }
-
-  // 2. Handle existing round
-  if (currentRoundId > 0n) {
-    const round = (await query("get_round", predictContract, [
-      nativeToScVal(currentRoundId, { type: "u64" }),
-    ])) as Record<string, unknown> | null;
-
-    if (round) {
-      const status = (round.status as { tag: string }).tag;
-      const settleTs = Number(round.settle_ts);
-      const lockTs = Number(round.lock_ts);
-
-      log("round", {
-        id: currentRoundId.toString(), status,
-        secsUntilLock: Math.max(0, lockTs - now),
-        secsUntilSettle: Math.max(0, settleTs - now),
-      });
-
-      // Auto-bet if still open
-      if (now < lockTs && status === "Open") {
-        await autoBet(currentRoundId);
-      }
-
-      // Settle if ready
-      if (now >= settleTs && status !== "Settled") {
-        try {
-          await invoke(adminKeypair, predictContract, "settle", [
-            nativeToScVal(currentRoundId, { type: "u64" }),
-          ]);
-          const settled = (await query("get_round", predictContract, [
-            nativeToScVal(currentRoundId, { type: "u64" }),
-          ])) as Record<string, unknown>;
-          log("settled", {
-            id: currentRoundId.toString(),
-            outcome: (settled.outcome as { tag: string }).tag,
-            settle_price: (Number(settled.settle_price as bigint) / 1e14).toFixed(4),
-          });
-          // Open next round
-          await openNewRound();
-        } catch (e) {
-          const msg = String(e);
-          if (msg.includes("#6") || msg.includes("AlreadySettled")) {
-            await openNewRound();
-          } else { log("settle error", { err: msg }); }
-        }
-        return;
-      }
-
-      if (status === "Settled") await openNewRound();
-      return;
-    }
-  }
-
-  await openNewRound();
+/**
+ * Push a new price for this asset. create_round uses the oracle's timestamp as
+ * strike_ts and rejects a repeat, so this must land before every create_round.
+ */
+async function pushPrice(m: MarketConfig): Promise<void> {
+  const newPrice = walkPrice(m);
+  await invoke(adminKeypair, oracleContract, "update_asset_price", [
+    xdr.ScVal.scvSymbol(m.symbol),
+    i128(newPrice),
+  ]);
+  log("oracle updated", { market: m.symbol, price: (Number(newPrice) / 1e14).toFixed(m.decimals) });
 }
 
-async function openNewRound() {
-  try {
-    const id = await invoke(adminKeypair, predictContract, "create_round");
-    if (id !== null) {
-      currentRoundId = BigInt(id as string | number | bigint);
-      betTracker.clear();
-      log("round created", { id: currentRoundId.toString() });
-      await autoBet(currentRoundId);
-    }
-  } catch (e) {
-    const msg = String(e);
-    if (msg.includes("#14") || msg.includes("DuplicateRound") || msg.includes("Bad union")) {
-      // Oracle tick unchanged — re-read counter
-      const latest = await query("current_round_id", predictContract);
-      if (latest) currentRoundId = BigInt(latest as string | number | bigint);
-    } else { log("create_round error", { err: msg }); }
-  }
-}
+// ── Betting ───────────────────────────────────────────────────────────────────
 
-async function autoBet(roundId: bigint) {
-  for (const bettor of BETTORS) {
-    if (!bettor.secret) continue;
-    const keypair = Keypair.fromSecret(bettor.secret);
-    const key = `${roundId}-${keypair.publicKey()}`;
-    if (betTracker.has(key)) continue;
+const betTracker = new Set<string>();   // "symbol-roundId-pubkey"
+const claimTracker = new Set<string>(); // "symbol-roundId-pubkey"
+
+/** All bots bet at once — sequential bets can miss the lock window. */
+async function autoBet(m: MarketConfig, roundId: bigint): Promise<void> {
+  const predictContract = new Contract(m.contractId);
+  await Promise.all(BETTORS.map(async (bettor, idx) => {
+    const keypair = bettorKeypairs[idx];
+    const key = `${m.symbol}-${roundId}-${keypair.publicKey()}`;
+    if (betTracker.has(key)) return;
+    betTracker.add(key); // claim the slot up front so a retry can't double-bet
+
+    const fn = bettor.side === "above" ? "bet_above" : "bet_below";
     try {
-      const method = bettor.side === "above" ? "bet_above" : "bet_below";
-      await invoke(keypair, predictContract, method, [
-        nativeToScVal(keypair.publicKey(), { type: "address" }),
+      await invoke(keypair, predictContract, fn, [
+        new Address(keypair.publicKey()).toScVal(),
         nativeToScVal(roundId, { type: "u64" }),
-        xdr.ScVal.scvI128(new xdr.Int128Parts({
-          hi: xdr.Int64.fromString((bettor.amountStroops >> 64n).toString()),
-          lo: xdr.Uint64.fromString((bettor.amountStroops & 0xFFFFFFFFFFFFFFFFn).toString()),
-        })),
+        i128(bettor.amountStroops),
       ]);
-      betTracker.add(key);
-      log("auto-bet", {
-        wallet: bettor.name, side: bettor.side,
-        amount: `${Number(bettor.amountStroops) / 1e7} XLM`,
+      log("bet placed", {
+        market: m.symbol, round: roundId.toString(), wallet: bettor.name,
+        side: bettor.side, amountXlm: Number(bettor.amountStroops) / 1e7,
       });
     } catch (e) {
+      betTracker.delete(key); // let the next cycle retry while the round is open
+      log("bet failed", { market: m.symbol, round: roundId.toString(), wallet: bettor.name, err: String(e) });
+    }
+  }));
+}
+
+/**
+ * Claim a settled round for every bot. This is what recycles stake — winners get
+ * their payout, losers get the Ninetails partial refund, and a void round gives
+ * everything back. Without it the bots go broke and rounds void forever.
+ */
+async function autoClaim(m: MarketConfig, roundId: bigint): Promise<void> {
+  const predictContract = new Contract(m.contractId);
+  await Promise.all(BETTORS.map(async (bettor, idx) => {
+    const keypair = bettorKeypairs[idx];
+    const key = `${m.symbol}-${roundId}-${keypair.publicKey()}`;
+    if (claimTracker.has(key)) return;
+    claimTracker.add(key);
+
+    try {
+      const payout = await invoke(keypair, predictContract, "claim", [
+        new Address(keypair.publicKey()).toScVal(),
+        nativeToScVal(roundId, { type: "u64" }),
+      ]);
+      log("claimed", {
+        market: m.symbol, round: roundId.toString(), wallet: bettor.name,
+        payoutXlm: payout != null ? Number(payout) / 1e7 : "unknown",
+      });
+    } catch (e) {
+      // NothingToClaim (#9) is normal — the bot never bet this round, or the
+      // round voided with a zero position. Don't retry those.
       const msg = String(e);
-      if (!msg.includes("#9") && !msg.includes("AlreadyBet") && !msg.includes("#4")) {
-        log("bet error", { wallet: bettor.name, err: msg });
+      if (!msg.includes("#9") && !msg.includes("NothingToClaim")) {
+        claimTracker.delete(key);
+        log("claim failed", { market: m.symbol, round: roundId.toString(), wallet: bettor.name, err: msg });
       }
     }
+  }));
+}
+
+// ── Per-market cycle ──────────────────────────────────────────────────────────
+
+async function openRound(m: MarketConfig): Promise<void> {
+  const predictContract = new Contract(m.contractId);
+
+  // Fresh tick first, or create_round trips the DuplicateRound guard.
+  await pushPrice(m);
+
+  let newId: bigint | null = null;
+  try {
+    const res = await invoke(adminKeypair, predictContract, "create_round");
+    if (typeof res === "bigint" || typeof res === "number") newId = BigInt(res);
+  } catch (e) {
+    log("create_round failed", { market: m.symbol, err: String(e) });
+  }
+
+  // create_round can return null on an XDR decode hiccup even though the tx
+  // landed. Re-read the counter rather than lose the round.
+  if (newId === null) {
+    const latest = await query("current_round_id", predictContract);
+    if (typeof latest === "bigint" || typeof latest === "number") {
+      const n = BigInt(latest);
+      if (n > m.currentRoundId) newId = n;
+    }
+  }
+
+  if (newId === null) return;
+
+  m.currentRoundId = newId;
+  log("round created", { market: m.symbol, round: newId.toString() });
+  await autoBet(m, newId);
+}
+
+async function processMarket(m: MarketConfig): Promise<void> {
+  const predictContract = new Contract(m.contractId);
+  const now = Math.floor(Date.now() / 1000);
+
+  if (m.currentRoundId === 0n) {
+    const latestId = await query("current_round_id", predictContract);
+    if (typeof latestId === "bigint" || typeof latestId === "number") {
+      m.currentRoundId = BigInt(latestId);
+    }
+  }
+
+  if (m.currentRoundId === 0n) {
+    await openRound(m);
+    return;
+  }
+
+  const round = (await query("get_round", predictContract, [
+    nativeToScVal(m.currentRoundId, { type: "u64" }),
+  ])) as Record<string, unknown> | null;
+
+  if (!round) {
+    // Round fell out of temporary storage — start a fresh one.
+    m.currentRoundId = 0n;
+    await openRound(m);
+    return;
+  }
+
+  const status = (round.status as { tag: string }).tag;
+  const outcome = (round.outcome as { tag: string }).tag;
+  const settleTs = Number(round.settle_ts);
+  const lockTs = Number(round.lock_ts);
+
+  log("round status", {
+    market: m.symbol, round: m.currentRoundId.toString(), status,
+    poolAbove: Number(round.pool_above) / 1e7,
+    poolBelow: Number(round.pool_below) / 1e7,
+    secsUntilLock: Math.max(0, lockTs - now),
+    secsUntilSettle: Math.max(0, settleTs - now),
+  });
+
+  // Still open — make sure both sides are covered, then wait.
+  if (status === "Open" && now < lockTs) {
+    await autoBet(m, m.currentRoundId);
+    return;
+  }
+
+  // Settle once the window has passed.
+  if (status !== "Settled" && now >= settleTs) {
+    try {
+      await invoke(adminKeypair, predictContract, "settle", [
+        nativeToScVal(m.currentRoundId, { type: "u64" }),
+      ]);
+      log("round settled", { market: m.symbol, round: m.currentRoundId.toString() });
+    } catch (e) {
+      const msg = String(e);
+      if (!msg.includes("#6") && !msg.includes("AlreadySettled")) {
+        log("settle failed", { market: m.symbol, round: m.currentRoundId.toString(), err: msg });
+        return; // try again next cycle rather than abandoning the round
+      }
+    }
+  }
+
+  // Settled: pay the bots out, then roll straight into the next round.
+  if (status === "Settled" || now >= settleTs) {
+    const settledId = m.currentRoundId;
+    await autoClaim(m, settledId);
+    log("rolling to next round", { market: m.symbol, settled: settledId.toString(), outcome });
+    await openRound(m);
+  }
+}
+
+/**
+ * One independent loop per market. Self-scheduling: the next cycle is queued
+ * only after this one finishes, so slow RPC never stacks overlapping ticks the
+ * way a fixed setInterval does.
+ */
+async function marketLoop(m: MarketConfig): Promise<void> {
+  for (;;) {
+    try {
+      await processMarket(m);
+    } catch (e) {
+      log("market error", { market: m.symbol, err: String(e) });
+    }
+    await new Promise(r => setTimeout(r, POLL_MS));
   }
 }
 
 async function main() {
-  // Read current state
-  const id = await query("current_round_id", predictContract);
-  if (id) currentRoundId = BigInt(id as string | number | bigint);
-
   log("demo-keeper starting", {
-    predict: PREDICT_CONTRACT,
     oracle: ORACLE_CONTRACT,
-    roundSecs: ROUND_SECS,
-    lockSecs: LOCK_SECS,
+    pollMs: POLL_MS,
+    markets: MARKETS.map(m => `${m.symbol}:${m.contractId}`),
+    bettors: bettorKeypairs.map(k => k.publicKey()),
   });
 
-  while (true) {
-    try { await tick(); } catch (e) { log("tick error", { err: String(e) }); }
-    await new Promise(r => setTimeout(r, ROUND_SECS * 1000));
-  }
+  // All four markets run concurrently and never block each other.
+  await Promise.all(MARKETS.map(marketLoop));
 }
 
-main();
+main().catch((e) => { console.error(e); process.exit(1); });
