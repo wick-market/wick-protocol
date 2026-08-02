@@ -177,7 +177,7 @@ async function main() {
   log("xlm-keeper starting", { contract: CONTRACT_ID });
   while (true) {
     try { await tick(); } catch (e: unknown) { log("error", { err: String(e) }); }
-    await new Promise((r) => setTimeout(r, 60_000));
+    await new Promise((r) => setTimeout(r, 10_000)); // check every 10s for fast round turnover
   }
 }
 
