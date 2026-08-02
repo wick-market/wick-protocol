@@ -16,6 +16,7 @@ import {
   Contract, Keypair, Networks, rpc,
   TransactionBuilder, BASE_FEE, nativeToScVal, scValToNative, xdr, Address
 } from "@stellar/stellar-sdk";
+import { getSpot } from "./price-feed";
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
@@ -34,18 +35,22 @@ interface MarketConfig {
   price: bigint;
   decimals: number;
   currentRoundId: bigint;
+  /** Last value actually sent on-chain, for the anti-tie check in pushPrice. */
+  lastPushed?: bigint;
 }
 
 /**
- * Seed prices are in oracle units: USD × 1e14 (14 decimals, matching Reflector).
- * So $65,000 is 65_000 * 1e14 = 6.5e18, not 6.5e17 — the earlier values were a
- * factor of ten low and the UI showed BTC at $6,500.
+ * Starting prices in oracle units (USD × 1e14, matching Reflector's 14 decimals).
+ *
+ * These are only a cold-start placeholder: pushPrice overwrites them with real
+ * spot from ./price-feed on the first tick. They matter solely as the random-walk
+ * base if the price API is unreachable, so rough is fine.
  */
 const MARKETS: MarketConfig[] = [
-  { symbol: "XLM", contractId: "CCHKYSNNU27QYKBAWTPHCIHOZQISYQ3GUEC3KVCZ6QPPNWN4QQXTTM3K", price: 17500000000000n, decimals: 4, currentRoundId: 0n },      // $0.175
-  { symbol: "BTC", contractId: "CBIDB2UVODQFULE5GDOFCITHADLRWCPOCCN3FUPGKUDEHGZ7P3KRXIA4", price: 6500000000000000000n, decimals: 2, currentRoundId: 0n }, // $65,000
-  { symbol: "ETH", contractId: "CAIETRXOO3YYJE7YISGPODJ6HTF2SZY2PC3WPD54ZW2EAWWAMZZWL7IS", price: 340000000000000000n, decimals: 2, currentRoundId: 0n },  // $3,400
-  { symbol: "SOL", contractId: "CDAL2IADNQYUWDLZHN72EERCTT2SSPDC6RBXFHR3ZZHDTVGQHD4LG3T3", price: 18000000000000000n, decimals: 2, currentRoundId: 0n },   // $180
+  { symbol: "XLM", contractId: "CCHKYSNNU27QYKBAWTPHCIHOZQISYQ3GUEC3KVCZ6QPPNWN4QQXTTM3K", price: 17500000000000n, decimals: 4, currentRoundId: 0n },      // ~$0.175
+  { symbol: "BTC", contractId: "CBIDB2UVODQFULE5GDOFCITHADLRWCPOCCN3FUPGKUDEHGZ7P3KRXIA4", price: 6300000000000000000n, decimals: 2, currentRoundId: 0n }, // ~$63,000
+  { symbol: "ETH", contractId: "CAIETRXOO3YYJE7YISGPODJ6HTF2SZY2PC3WPD54ZW2EAWWAMZZWL7IS", price: 188000000000000000n, decimals: 2, currentRoundId: 0n },  // ~$1,880
+  { symbol: "SOL", contractId: "CDAL2IADNQYUWDLZHN72EERCTT2SSPDC6RBXFHR3ZZHDTVGQHD4LG3T3", price: 7360000000000000n, decimals: 2, currentRoundId: 0n },    // ~$73.60
 ];
 
 /**
@@ -135,7 +140,7 @@ async function query(method: string, contract: Contract, args: xdr.ScVal[] = [])
 
 // ── Oracle ────────────────────────────────────────────────────────────────────
 
-/** Random walk, ±0.3% per tick. */
+/** Random walk, ±0.3% per tick. Offline fallback only — see pushPrice. */
 function walkPrice(m: MarketConfig): bigint {
   const changePct = (Math.random() - 0.5) * 0.006;
   m.price = BigInt(Math.round(Number(m.price) * (1 + changePct)));
@@ -143,21 +148,45 @@ function walkPrice(m: MarketConfig): bigint {
 }
 
 /**
- * Push a new price for this asset. create_round uses the oracle's timestamp as
- * strike_ts and rejects a repeat, so this must land before every create_round.
+ * Push the current price for this asset.
+ *
+ * Real spot from the shared feed, falling back to a random walk only if the
+ * feed is unreachable — a blocked API should degrade to a still-moving demo
+ * rather than stall round production.
+ *
+ * create_round takes the oracle's timestamp as strike_ts and rejects a repeat,
+ * so this must land before every create_round.
  */
 async function pushPrice(m: MarketConfig): Promise<void> {
-  const newPrice = walkPrice(m);
-  // Two cycles landing on the same number would give the next round the same
-  // strike as the last — read-back tie, instant Void. Nudge so strikes differ.
-  if (newPrice === m.price) {
-    m.price = (m.price * 1000000001n) / 1000000000n;
+  let source = "spot";
+  const quote = await getSpot(m.symbol);
+
+  if (quote) {
+    m.price = quote.units;
+  } else {
+    walkPrice(m);
+    source = "walk";
   }
+
+  // A 60s round can close with spot unchanged at the feed's precision. The
+  // contract reads settle_price back, sees it equal to strike, calls that a tie
+  // and Voids. Nudge by 1e-9 relative so the round resolves; far below display
+  // precision, so the shown price is still the real one.
+  if (m.price === m.lastPushed) {
+    m.price = (m.price * 1000000001n) / 1000000000n;
+    source += "+nudge";
+  }
+  m.lastPushed = m.price;
+
   await invoke(adminKeypair, oracleContract, "update_asset_price", [
     xdr.ScVal.scvSymbol(m.symbol),
     i128(m.price),
   ]);
-  log("oracle updated", { market: m.symbol, price: (Number(m.price) / 1e14).toFixed(m.decimals) });
+  log("oracle updated", {
+    market: m.symbol,
+    price: (Number(m.price) / 1e14).toFixed(m.decimals),
+    source,
+  });
 }
 
 // ── Betting ───────────────────────────────────────────────────────────────────
