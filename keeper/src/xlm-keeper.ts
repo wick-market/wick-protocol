@@ -75,10 +75,18 @@ async function invoke(method: string, args: xdr.ScVal[] = []): Promise<unknown> 
     const result = await server.getTransaction(send.hash);
     if (result.status === rpc.Api.GetTransactionStatus.SUCCESS) {
       const rv = (result as rpc.Api.GetSuccessfulTransactionResponse).returnValue;
-      return rv ? scValToNative(rv) : null;
+      try {
+        return rv ? scValToNative(rv) : null;
+      } catch {
+        // XDR parse error — value exists but can't be decoded; treat as null
+        return null;
+      }
     }
-    if (result.status === rpc.Api.GetTransactionStatus.FAILED)
-      throw new Error(`on-chain ${method} failed`);
+    if (result.status === rpc.Api.GetTransactionStatus.FAILED) {
+      // Extract contract error code from the failed transaction result
+      const failedRes = result as rpc.Api.GetFailedTransactionResponse;
+      throw new Error(`on-chain ${method} failed: ${JSON.stringify(failedRes.resultXdr ?? "")}`);
+    }
   }
   throw new Error(`${method} timed out`);
 }
@@ -88,14 +96,22 @@ let currentRoundId = 0n;
 async function openNewRound(): Promise<void> {
   try {
     const id = await invoke("create_round");
-    currentRoundId = BigInt(id as string | number);
-    log("round created", { id: currentRoundId.toString() });
+    if (id !== null && id !== undefined) {
+      currentRoundId = BigInt(id as string | number | bigint);
+      log("round created", { id: currentRoundId.toString() });
+    } else {
+      // null return = XDR parse error after successful tx.
+      // Re-read the counter to get the actual new round id.
+      const latest = await query("current_round_id");
+      currentRoundId = BigInt(latest as string | number | bigint);
+      log("round created (id from counter)", { id: currentRoundId.toString() });
+    }
   } catch (e: unknown) {
     const msg = String(e);
-    if (msg.includes("DuplicateRound") || msg.includes("#14")) {
+    if (msg.includes("DuplicateRound") || msg.includes("#14") || msg.includes("Bad union")) {
       log("duplicate — oracle tick unchanged, waiting for next tick");
     } else {
-      throw e;
+      log("create_round error", { err: msg });
     }
   }
 }
