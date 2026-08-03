@@ -1,8 +1,8 @@
 import { Keypair, Contract, rpc, Networks, TransactionBuilder, xdr, Address } from "@stellar/stellar-sdk";
+import { ADMIN_SECRET } from "./env";
 
 const RPC_URL = "https://soroban-testnet.stellar.org";
 const NETWORK = Networks.TESTNET;
-const ADMIN_SECRET = "SDGZDDLJCCE6BQGROTACAZGLI3OIFNM3DTJJL7RZRM5KNQSDLXQUS73E";
 const TOKEN_ADDRESS = "CDLZFC3SYJYDZT7K67VZ75HPJVIEUVNIXF47ZG2FB2RMQQVU2HHGCYSC";
 const ORACLE_CONTRACT = "CBCZDSMRMOYXRLV3IJNC6LC7HKV2UFE5KQ63P5LAKM73LAH4H4CNT4TM";
 

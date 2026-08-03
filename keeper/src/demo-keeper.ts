@@ -11,19 +11,17 @@
  * Step 3 is what keeps this running: without claiming, the bot wallets drain
  * within an hour and every round voids for want of an opposing side.
  */
-import "dotenv/config";
 import {
   Contract, Keypair, Networks, rpc,
   TransactionBuilder, BASE_FEE, nativeToScVal, scValToNative, xdr, Address
 } from "@stellar/stellar-sdk";
 import { getSpot } from "./price-feed";
+import { ADMIN_SECRET, BOT_SECRETS } from "./env";
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
 const RPC_URL = "https://soroban-testnet.stellar.org";
 const NETWORK = Networks.TESTNET;
-const ADMIN_SECRET = (process.env.ADMIN_SECRET
-  ?? "SDGZDDLJCCE6BQGROTACAZGLI3OIFNM3DTJJL7RZRM5KNQSDLXQUS73E").trim();
 const ORACLE_CONTRACT = "CBCZDSMRMOYXRLV3IJNC6LC7HKV2UFE5KQ63P5LAKM73LAH4H4CNT4TM";
 
 /** How often each market loop wakes up. Rounds are 60s, so this is just slack. */
@@ -59,9 +57,9 @@ const MARKETS: MarketConfig[] = [
  * only tops up to 10k.
  */
 const BETTORS = [
-  { secret: "SBB4U4OKPILVJBWNIBBFOSHMBKHBMN6HHDX6DEZV5HWANM2FRYSIRRT2".trim(), name: "wallet-1", side: "above" as const, amountStroops: 300000000n }, // 30 XLM Above
-  { secret: "SCALTGO6MAGGWL43HACE5L6STUQZ7T3TYO6MBQ7HAAVBK6FRTRY7TPH3".trim(), name: "wallet-2", side: "below" as const, amountStroops: 200000000n }, // 20 XLM Below
-  { secret: "SB4RSZRZ6GQLA5IQNPFO7OXSOTOSWLJV7LRCQM3UMU2DXWAUL2X5VHOZ".trim(), name: "wallet-3", side: "below" as const, amountStroops: 200000000n }, // 20 XLM Below
+  { secret: BOT_SECRETS[0], name: "wallet-1", side: "above" as const, amountStroops: 300000000n }, // 30 XLM Above
+  { secret: BOT_SECRETS[1], name: "wallet-2", side: "below" as const, amountStroops: 200000000n }, // 20 XLM Below
+  { secret: BOT_SECRETS[2], name: "wallet-3", side: "below" as const, amountStroops: 200000000n }, // 20 XLM Below
 ];
 
 const server = new rpc.Server(RPC_URL, { allowHttp: false });
