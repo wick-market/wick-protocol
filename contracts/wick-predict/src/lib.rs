@@ -81,6 +81,9 @@ pub enum Error {
     Unauthorized        = 13,
     DuplicateRound      = 14,
     OracleNoPrice       = 15,
+    /// lock_offset must land strictly before settle, or betting stays open
+    /// past the moment the outcome is already knowable.
+    LockOffsetTooLate   = 16,
 }
 
 // ── Types ─────────────────────────────────────────────────────────────────────
@@ -585,7 +588,24 @@ impl WickPredict {
         let mut config = require_config(&e);
         config.admin.require_auth();
         if seconds < MIN_LOCK_OFFSET { panic_with_error!(&e, Error::LockOffsetTooSmall); }
+        // Betting must close before settle. Equal is not enough: at lock_ts ==
+        // settle_ts the settle price is already determined, so a bet landing in
+        // that same second would be a free win.
+        if seconds >= config.oracle_interval { panic_with_error!(&e, Error::LockOffsetTooLate); }
         config.lock_offset = seconds;
+        e.storage().instance().set(&Key::Config, &config);
+        bump_instance(&e);
+    }
+
+    /// Round length: settle_ts = strike_ts + oracle_interval.
+    ///
+    /// Must stay strictly above lock_offset, so shortening a round cannot
+    /// silently swallow the lock window that set_lock_offset guards.
+    pub fn set_oracle_interval(e: Env, seconds: u64) {
+        let mut config = require_config(&e);
+        config.admin.require_auth();
+        if seconds <= config.lock_offset { panic_with_error!(&e, Error::LockOffsetTooLate); }
+        config.oracle_interval = seconds;
         e.storage().instance().set(&Key::Config, &config);
         bump_instance(&e);
     }
@@ -978,6 +998,66 @@ mod tests {
         let ctx = Ctx::new();
         ctx.open();
         err!(ctx.client().try_create_round(), Error::DuplicateRound);
+    }
+
+    // ── Lock window ───────────────────────────────────────────────────────────
+    // Betting must close strictly before settle. If lock_ts reaches settle_ts a
+    // bet could land in the same second the settle price is read, which is a
+    // free win — so both setters guard the gap from their own side.
+
+    #[test]
+    fn lock_offset_at_or_past_settle_rejected() {
+        let ctx = Ctx::new();
+        // Harness initializes with oracle_interval = 300.
+        err!(ctx.client().try_set_lock_offset(&300), Error::LockOffsetTooLate);
+        err!(ctx.client().try_set_lock_offset(&301), Error::LockOffsetTooLate);
+        // Just inside the boundary is fine.
+        ctx.client().set_lock_offset(&299);
+        assert_eq!(ctx.client().get_config().lock_offset, 299);
+    }
+
+    #[test]
+    fn interval_cannot_shrink_below_lock() {
+        let ctx = Ctx::new();
+        ctx.client().set_lock_offset(&120);
+        // Shrinking the round to the lock point (or past it) would leave no
+        // window, so it is refused rather than silently clamped.
+        err!(ctx.client().try_set_oracle_interval(&120), Error::LockOffsetTooLate);
+        err!(ctx.client().try_set_oracle_interval(&90), Error::LockOffsetTooLate);
+        ctx.client().set_oracle_interval(&121);
+        assert_eq!(ctx.client().get_config().oracle_interval, 121);
+    }
+
+    #[test]
+    fn widened_betting_window_still_locks_before_settle() {
+        let ctx = Ctx::new();
+        // The change this exists for: 45s betting -> 60s, round 60s -> 75s.
+        // Order matters — the new interval must clear the *current* lock, so
+        // narrow the lock first. Doing it the other way is what the guard
+        // refuses, which is the point.
+        ctx.client().set_lock_offset(&60);
+        ctx.client().set_oracle_interval(&75);
+
+        let id = ctx.open();
+        let r = ctx.client().get_round(&id);
+        assert_eq!(r.lock_ts - r.strike_ts, 60, "betting window should be 60s");
+        assert_eq!(r.settle_ts - r.strike_ts, 75, "round should be 75s");
+        assert!(r.lock_ts < r.settle_ts, "lock must precede settle");
+
+        // A bet at 59s lands; at 60s it does not.
+        let alice = Address::generate(&ctx.env);
+        let bob = Address::generate(&ctx.env);
+        ctx.mint(&alice, 2_000_000_000);
+        ctx.mint(&bob, 2_000_000_000);
+
+        ctx.set_ts(r.strike_ts + 59);
+        ctx.client().bet_above(&alice, &id, &1_000_000_000);
+
+        ctx.set_ts(r.lock_ts);
+        err!(
+            ctx.client().try_bet_below(&bob, &id, &1_000_000_000),
+            Error::RoundLocked
+        );
     }
 
     // ── The key invariant ─────────────────────────────────────────────────────
