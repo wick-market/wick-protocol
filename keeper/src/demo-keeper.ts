@@ -22,7 +22,7 @@ import { ADMIN_SECRET, BOT_SECRETS } from "./env";
 
 const RPC_URL = "https://soroban-testnet.stellar.org";
 const NETWORK = Networks.TESTNET;
-const ORACLE_CONTRACT = "CBCZDSMRMOYXRLV3IJNC6LC7HKV2UFE5KQ63P5LAKM73LAH4H4CNT4TM";
+const ORACLE_CONTRACT = "CBGWLGKZMEMW2IHDSXRL5QUTYRXSBGNCMQHFHRVZH6UETCNXV4NFDHAG";
 
 /** How often each market loop wakes up. Rounds are 60s, so this is just slack. */
 const POLL_MS = 5_000;
@@ -45,10 +45,10 @@ interface MarketConfig {
  * base if the price API is unreachable, so rough is fine.
  */
 const MARKETS: MarketConfig[] = [
-  { symbol: "XLM", contractId: "CCHKYSNNU27QYKBAWTPHCIHOZQISYQ3GUEC3KVCZ6QPPNWN4QQXTTM3K", price: 17500000000000n, decimals: 4, currentRoundId: 0n },      // ~$0.175
-  { symbol: "BTC", contractId: "CBIDB2UVODQFULE5GDOFCITHADLRWCPOCCN3FUPGKUDEHGZ7P3KRXIA4", price: 6300000000000000000n, decimals: 2, currentRoundId: 0n }, // ~$63,000
-  { symbol: "ETH", contractId: "CAIETRXOO3YYJE7YISGPODJ6HTF2SZY2PC3WPD54ZW2EAWWAMZZWL7IS", price: 188000000000000000n, decimals: 2, currentRoundId: 0n },  // ~$1,880
-  { symbol: "SOL", contractId: "CDAL2IADNQYUWDLZHN72EERCTT2SSPDC6RBXFHR3ZZHDTVGQHD4LG3T3", price: 7360000000000000n, decimals: 2, currentRoundId: 0n },    // ~$73.60
+  { symbol: "XLM", contractId: "CBQMEF4YZVTEVV3KHSUVOBWWHTTJ2D6YAOGE5TGZT7WTMHJ7ORYMT5HU", price: 17200000000000n, decimals: 4, currentRoundId: 0n },      // ~$0.172
+  { symbol: "BTC", contractId: "CAHYZ6K54567DHRSHEOB6BEFDD6GOXGIMX736RJWSSSA6DHLOHKFDOX2", price: 6370000000000000000n, decimals: 2, currentRoundId: 0n }, // ~$63,700
+  { symbol: "ETH", contractId: "CC4MONXL6CIZ5F4VSNE2CFQZ6HXTSDJHEEUNGVUSFPUEZUJ7KAOWXSOM", price: 186000000000000000n, decimals: 2, currentRoundId: 0n },  // ~$1,860
+  { symbol: "SOL", contractId: "CDDEM7TRNHQMIYTOYZUIFLOAF32K5MBP4WSDMKUGGGPGDCGU73CEYCJN", price: 7350000000000000n, decimals: 2, currentRoundId: 0n },    // ~$73.50
 ];
 
 /**
