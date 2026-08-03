@@ -141,6 +141,7 @@ pub struct Config {
     pub admin: Address,
     pub oracle: Address,
     pub token: Address,
+    pub asset: Symbol,
     pub fee_bps: u32,
     pub min_bet: i128,
     pub lock_offset: u64,
@@ -170,10 +171,6 @@ pub trait OracleTrait {
     fn lastprice(env: Env, asset: OracleAsset) -> Option<PriceData>;
     fn price(env: Env, asset: OracleAsset, timestamp: u64) -> Option<PriceData>;
     fn decimals(env: Env) -> u32;
-}
-
-fn xlm_asset(e: &Env) -> OracleAsset {
-    OracleAsset::Other(Symbol::new(e, "XLM"))
 }
 
 // ── Pure math ─────────────────────────────────────────────────────────────────
@@ -306,6 +303,7 @@ impl WickPredict {
         admin: Address,
         oracle: Address,
         token: Address,
+        asset: Symbol,
         fee_bps: u32,
         min_bet: i128,
         lock_offset: u64,
@@ -320,7 +318,7 @@ impl WickPredict {
 
         let decimals = OracleClient::new(&e, &oracle).decimals();
         e.storage().instance().set(&Key::Config, &Config {
-            admin, oracle, token, fee_bps, min_bet, lock_offset,
+            admin, oracle, token, asset, fee_bps, min_bet, lock_offset,
             oracle_decimals: decimals,
             oracle_interval,
         });
@@ -335,7 +333,7 @@ impl WickPredict {
         let config = require_config(&e);
         let oracle = OracleClient::new(&e, &config.oracle);
         let tick = oracle
-            .lastprice(&xlm_asset(&e))
+            .lastprice(&OracleAsset::Other(config.asset.clone()))
             .unwrap_or_else(|| panic_with_error!(&e, Error::OracleNoPrice));
 
         let strike_ts = tick.timestamp;
@@ -433,7 +431,7 @@ impl WickPredict {
         if e.ledger().timestamp() < round.settle_ts { panic_with_error!(&e, Error::TooEarly); }
 
         let oracle = OracleClient::new(&e, &config.oracle);
-        let price_data = oracle.price(&xlm_asset(&e), &round.settle_ts);
+        let price_data = oracle.price(&OracleAsset::Other(config.asset.clone()), &round.settle_ts);
 
         let outcome = match price_data {
             None => Outcome::Void,
@@ -664,7 +662,8 @@ mod tests {
             let oracle = env.register(MockOracle, ());
             let token = env.register_stellar_asset_contract_v2(admin.clone()).address();
             let c = env.register(WickPredict, ());
-            WickPredictClient::new(&env, &c).initialize(&admin, &oracle, &token, &FEE, &MIN, &LOCK, &300u64);
+            let asset = soroban_sdk::Symbol::new(&env, "XLM");
+            WickPredictClient::new(&env, &c).initialize(&admin, &oracle, &token, &asset, &FEE, &MIN, &LOCK, &300u64);
             Ctx { env, c, oracle, token, admin }
         }
         fn client(&self) -> WickPredictClient { WickPredictClient::new(&self.env, &self.c) }
