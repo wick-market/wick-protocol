@@ -30,7 +30,7 @@
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, panic_with_error,
-    symbol_short, token, Address, Env, Symbol,
+    symbol_short, token, Address, BytesN, Env, Symbol,
 };
 
 // ── Constants ─────────────────────────────────────────────────────────────────
@@ -588,6 +588,31 @@ impl WickPredict {
         config.lock_offset = seconds;
         e.storage().instance().set(&Key::Config, &config);
         bump_instance(&e);
+    }
+
+    /// Hand the admin role to a new address.
+    ///
+    /// Without this a leaked admin key is permanent: the key signs create_round,
+    /// settle, sweep_fees and the fee/offset setters, and the only remedy would
+    /// be redeploying and abandoning every open round. Requires auth from both
+    /// sides so a typo cannot strand the contract on an address nobody holds.
+    pub fn set_admin(e: Env, new_admin: Address) {
+        let mut config = require_config(&e);
+        config.admin.require_auth();
+        new_admin.require_auth();
+        config.admin = new_admin;
+        e.storage().instance().set(&Key::Config, &config);
+        bump_instance(&e);
+    }
+
+    /// Swap the contract's own code, preserving all storage.
+    ///
+    /// The counterpart to set_admin: it lets a fix ship without new contract
+    /// IDs, so the frontend and round history survive an upgrade.
+    pub fn upgrade(e: Env, new_wasm_hash: BytesN<32>) {
+        let config = require_config(&e);
+        config.admin.require_auth();
+        e.deployer().update_current_contract_wasm(new_wasm_hash);
     }
 }
 

@@ -12,10 +12,21 @@
 
 #![no_std]
 
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Symbol};
+use soroban_sdk::{contract, contractimpl, contracttype, Address, BytesN, Env, Symbol};
 
 #[contracttype]
 enum Key { Admin, Price, Timestamp, AssetPrice(Symbol), AssetTs(Symbol) }
+
+/// The stored admin, or panic if the contract was never initialized.
+fn require_admin(e: &Env) -> Address {
+    let admin: Address = e
+        .storage()
+        .instance()
+        .get(&Key::Admin)
+        .expect("oracle not initialized");
+    admin.require_auth();
+    admin
+}
 
 #[contracttype]
 #[derive(Clone)]
@@ -44,14 +55,17 @@ impl TestOracle {
         e.storage().instance().set(&Key::Timestamp, &e.ledger().timestamp());
     }
 
-    /// Set a new price for default asset.
+    /// Set a new price for default asset. Admin only.
     pub fn update_price(e: Env, price: i128) {
+        require_admin(&e);
         e.storage().instance().set(&Key::Price, &price);
         e.storage().instance().set(&Key::Timestamp, &e.ledger().timestamp());
     }
 
     /// Set a new price for a specific asset symbol (e.g. BTC, ETH, SOL, XLM).
+    /// Admin only — this is the value every market settles against.
     pub fn update_asset_price(e: Env, asset: Symbol, price: i128) {
+        require_admin(&e);
         let ts = e.ledger().timestamp();
         e.storage().instance().set(&Key::AssetPrice(asset.clone()), &price);
         e.storage().instance().set(&Key::AssetTs(asset.clone()), &ts);
@@ -92,5 +106,21 @@ impl TestOracle {
         let price: i128 = e.storage().instance().get(&Key::Price).unwrap_or(0);
         let ts: u64 = e.storage().instance().get(&Key::Timestamp).unwrap_or(0);
         (price, ts)
+    }
+
+    // ── Admin ─────────────────────────────────────────────────────────────────
+
+    /// Hand the admin role to a new address. Both sides must authorize, so a
+    /// typo cannot strand the oracle on an address nobody holds.
+    pub fn set_admin(e: Env, new_admin: Address) {
+        require_admin(&e);
+        new_admin.require_auth();
+        e.storage().instance().set(&Key::Admin, &new_admin);
+    }
+
+    /// Swap the contract's own code, preserving stored prices and admin.
+    pub fn upgrade(e: Env, new_wasm_hash: BytesN<32>) {
+        require_admin(&e);
+        e.deployer().update_current_contract_wasm(new_wasm_hash);
     }
 }
